@@ -48,6 +48,30 @@ enum {
 #define kRingFrames          8192      /* zero-timestamp period (frames) */
 #define kSafetyOffsetFrames  256  /* tried 128: round-trip got WORSE (59.8→62.3ms, phase shifted later) — does not shrink physical path, only scheduling phase. Keep 256. */
 
+/*
+ * Fill-servo constants (see Drv_GetZeroTimeStamp). The OUT ring is a pure
+ * integrator: d(fill)/dt = perceived_rate - device_rate. We set
+ *   perceived_rate = device_rate - GAIN*(fill - setpoint)
+ * by trimming the zero-timestamp slope, giving first-order convergence of the
+ * standing fill to RK3_OUT_FILL_SETPOINT with time constant ~1/GAIN seconds.
+ * GetZeroTimeStamp is the servo's sample point (called once per kRingFrames, so
+ * ~6 Hz here): GAIN*period << 2 keeps the discrete loop well damped. The trim is
+ * clamped so the perceived rate never deviates more than ±1% from nominal (a
+ * balloon then drains at up to 1%*Fs ≈ 480 frames/s; inaudible — no resampling).
+ */
+#define kFillServoGain     0.75   /* 1/sec: fill-error -> rate-trim convergence rate */
+#define kFillServoTrimMax  0.01   /* clamp |perceived-rate trim| to 1% (inaudible; no resample) */
+/*
+ * The raw OUT-ring fill is a sawtooth (consumer pops a whole isoc transfer per
+ * out_done while CoreAudio dribbles it back in), so a single sample is noisy and
+ * phase-dependent. The servo controls an EMA of it instead. alpha at the ~6 Hz
+ * zero-timestamp rate gives a ~1 s smoothing time constant — long enough to reject
+ * the sawtooth, short enough to track the startup transient and balloons.
+ * gain 2.0 + alpha 0.15 overshot the startup drain and crushed the troughs to ~10
+ * (→ 19 underruns); 0.75 + 0.10 is gentler and calmer.
+ */
+#define kFillServoAlpha    0.10
+
 /* ---- driver state ---------------------------------------------------- */
 
 static AudioServerPlugInDriverInterface gInterface;
@@ -60,10 +84,21 @@ static pthread_mutex_t gStateMutex = PTHREAD_MUTEX_INITIALIZER;
 static struct rk3_engine gEngine;       /* zero-initialized */
 static UInt32 gIOCount = 0;             /* StartIO/StopIO refcount */
 
-/* zero-timestamp host clock */
-static Float64 gHostTicksPerFrame = 0.0;
-static UInt64  gAnchorHostTime = 0;
-static UInt64  gNumberTimeStamps = 0;
+/*
+ * Zero-timestamp clock + fill servo. The timeline is a line through the anchor
+ * point (gAnchorHostTime, gAnchorSampleTime) with slope gTicksPerFrame. The servo
+ * adjusts the slope (gServoTrim) to hold the engine's OUT-ring fill at the
+ * setpoint; each adjustment re-pivots the anchor around "now" so the
+ * sampleTime<->hostTime mapping stays continuous (no timestamp jump). All written
+ * and read only on the CoreAudio IO thread (Drv_GetZeroTimeStamp), so no locking.
+ */
+static Float64 gNominalTicksPerFrame = 0.0; /* host ticks/frame at the nominal rate */
+static Float64 gTicksPerFrame        = 0.0; /* current servo-trimmed ticks/frame */
+static Float64 gServoTrim            = 0.0; /* fractional perceived-rate trim, clamped */
+static Float64 gFillAvg              = -1.0; /* EMA of OUT-ring fill (frames); <0 = uninit */
+static UInt64  gAnchorHostTime       = 0;   /* host time of gAnchorSampleTime */
+static Float64 gAnchorSampleTime     = 0.0; /* sample time at the anchor */
+static UInt64  gNumberTimeStamps     = 0;   /* last reported period index (monotonic) */
 
 static const AudioStreamBasicDescription kFormat = {
 	.mSampleRate       = kSampleRate,
@@ -111,8 +146,9 @@ static OSStatus Drv_Initialize(AudioServerPlugInDriverRef inDriver,
 	mach_timebase_info(&tb);
 	/* host ticks per second = 1e9 * denom/numer ; per frame = /rate */
 	double ticksPerSec = 1.0e9 * (double)tb.denom / (double)tb.numer;
-	gHostTicksPerFrame = ticksPerSec / kSampleRate;
-	DLOG("Initialize: hostTicksPerFrame=%.3f", gHostTicksPerFrame);
+	gNominalTicksPerFrame = ticksPerSec / kSampleRate;
+	gTicksPerFrame = gNominalTicksPerFrame;
+	DLOG("Initialize: nominalTicksPerFrame=%.3f", gNominalTicksPerFrame);
 	return 0;
 }
 
@@ -397,22 +433,28 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 		 * Honest presentation latency the host (Reaper PDC + display) can
 		 * see. CoreAudio adds buffer + SafetyOffset on top. Reported once,
 		 * on the device object (scope-aware); streams return 0 so the host
-		 * does not double-count. One isoc transfer = RK3_FRAMES_PER_XFER
-		 * microframes of audio (8 microframes = 1 ms => * rate/8000).
+		 * does not double-count. One isoc transfer = FRAMES_PER_XFER
+		 * microframes of audio (8 microframes = 1 ms => * rate/8000); OUT
+		 * and IN now use different transfer sizes (RK3_OUT_FRAMES_PER_XFER
+		 * vs RK3_FRAMES_PER_XFER), so account for them separately.
 		 */
 		UInt32 frames = 0;
 		if (o == kObjID_Device) {
-			UInt32 xferFrames =
-				(UInt32)(RK3_FRAMES_PER_XFER * (kSampleRate / 8000.0));
-			if (a->mScope == kAudioObjectPropertyScopeOutput)
-				/* standing OUT ring cushion + the N_OUT_XFERS-deep isoc
-				 * pipeline (each refilled buffer is rescheduled
-				 * N_OUT_XFERS * stride ahead before it is heard) */
-				frames = RK3_OUT_CUSHION / RK3_BYTES_PER_FRAME
-				       + RK3_N_OUT_XFERS * xferFrames;
-			else
+			if (a->mScope == kAudioObjectPropertyScopeOutput) {
+				UInt32 outXfer = (UInt32)(RK3_OUT_FRAMES_PER_XFER
+						* (kSampleRate / 8000.0));
+				/* servo-held standing OUT-ring fill (steady state =
+				 * setpoint, NOT the initial-only cushion) + the
+				 * N_OUT_XFERS-deep isoc pipeline (each refilled buffer
+				 * is rescheduled N_OUT_XFERS * stride ahead before it is
+				 * heard) */
+				frames = RK3_OUT_FILL_SETPOINT
+				       + RK3_N_OUT_XFERS * outXfer;
+			} else {
 				/* one capture transfer before samples surface */
-				frames = xferFrames;
+				frames = (UInt32)(RK3_FRAMES_PER_XFER
+						* (kSampleRate / 8000.0));
+			}
 		}
 		*outSize = sizeof(UInt32); *(UInt32 *)out = frames; return 0;
 	}
@@ -518,6 +560,10 @@ static OSStatus Drv_StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt3
 			rc = kAudioHardwareNotRunningError;
 		} else {
 			gAnchorHostTime = mach_absolute_time();
+			gAnchorSampleTime = 0.0;
+			gTicksPerFrame = gNominalTicksPerFrame;
+			gServoTrim = 0.0;
+			gFillAvg = -1.0;
 			gNumberTimeStamps = 0;
 			gIOCount = 1;
 			DLOG("StartIO: engine running");
@@ -546,14 +592,81 @@ static OSStatus Drv_GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID
 {
 	(void)d;(void)o;(void)c;
 	UInt64 now = mach_absolute_time();
-	Float64 framesSinceAnchor = (Float64)(now - gAnchorHostTime) / gHostTicksPerFrame;
-	UInt64 periods = (UInt64)(framesSinceAnchor / (Float64)kRingFrames);
-	if (periods > gNumberTimeStamps)
-		gNumberTimeStamps = periods;
-	*outSampleTime = (Float64)(gNumberTimeStamps * kRingFrames);
-	*outHostTime   = gAnchorHostTime +
-		(UInt64)((Float64)(gNumberTimeStamps * kRingFrames) * gHostTicksPerFrame);
-	*outSeed = 1;
+
+	/*
+	 * Canonical stepwise zero-timestamp: the anchor (gAnchorHostTime,
+	 * gAnchorSampleTime) IS the last reported timestamp and is held CONSTANT for
+	 * the whole period; it only steps forward when `now` crosses into a new
+	 * period. Returning a constant pair within a period and a strictly increasing
+	 * pair across periods is what CoreAudio requires — an earlier version
+	 * re-pivoted on every call, which made the reported hostTime non-monotonic
+	 * whenever the servo changed the rate and spun the IO thread to 100% CPU.
+	 *
+	 * The rate (gTicksPerFrame) is only changed AT a period boundary, pivoting
+	 * around the freshly reported timestamp, so a rate change rotates only the
+	 * FUTURE slope and never moves an already-reported timestamp. This keeps the
+	 * servo correct AND the timeline monotonic.
+	 */
+	Float64 sampleNow = gAnchorSampleTime +
+		(Float64)(now - gAnchorHostTime) / gTicksPerFrame;
+	UInt64 period = (UInt64)(sampleNow / (Float64)kRingFrames);
+
+	if (period > gNumberTimeStamps) {
+		/* Crossed into a new period: advance the anchor to that boundary on the
+		 * current line (newSample >= old anchor, so the cast is non-negative and
+		 * the new host time is strictly later — monotonic). */
+		Float64 newSample = (Float64)(period * kRingFrames);
+		UInt64  newHost   = gAnchorHostTime +
+			(UInt64)((newSample - gAnchorSampleTime) * gTicksPerFrame);
+		gAnchorSampleTime = newSample;
+		gAnchorHostTime   = newHost;
+		gNumberTimeStamps = period;
+
+		/*
+		 * Fill servo (runs once per period, ~6 Hz): trim the perceived device
+		 * rate so the OUT-ring standing fill converges to RK3_OUT_FILL_SETPOINT.
+		 * fill < 0 = playout not started yet, leave the trim unchanged. A positive
+		 * fill error (ring too full) slows the perceived rate so CoreAudio
+		 * produces a touch slower and the device drains the excess; negative
+		 * speeds it up. Click-free: nothing is resampled, the ring just settles.
+		 */
+		int fill = rk3_engine_out_fill_frames(&gEngine);
+		if (fill >= 0) {
+			/*
+			 * EMA-smooth the noisy sawtooth fill before acting on it.
+			 * SOFT-START: seed the EMA to the SETPOINT, not to the first
+			 * observed fill. The ring starts at RK3_OUT_CUSHION (well above
+			 * setpoint), so seeding to the real fill made err huge at t0 and
+			 * the servo slammed a big NEGATIVE trim, slowing CoreAudio right
+			 * as the device consumes fast at startup -> OUT drained to 0 ->
+			 * underruns (seen once we lowered the setpoint). Seeding to the
+			 * setpoint makes err start ~0; the EMA then tracks the real fill
+			 * as the cushion drains gently. Steady state is unaffected (the
+			 * EMA converges to the real fill regardless of its seed).
+			 */
+			if (gFillAvg < 0.0) gFillAvg = (Float64)RK3_OUT_FILL_SETPOINT;
+			else gFillAvg += kFillServoAlpha * ((Float64)fill - gFillAvg);
+
+			Float64 err = gFillAvg - (Float64)RK3_OUT_FILL_SETPOINT;
+			Float64 trim = -(kFillServoGain * err) / kSampleRate;
+			if (trim >  kFillServoTrimMax) trim =  kFillServoTrimMax;
+			if (trim < -kFillServoTrimMax) trim = -kFillServoTrimMax;
+			gServoTrim = trim;
+			gTicksPerFrame = gNominalTicksPerFrame / (1.0 + gServoTrim);
+
+			static unsigned servo_ctr;
+			if (++servo_ctr >= 6) {   /* ~once/sec */
+				servo_ctr = 0;
+				DLOG("servo: fill=%d avg=%.0f setpoint=%d trim=%+.4f%%",
+				     fill, gFillAvg, RK3_OUT_FILL_SETPOINT,
+				     gServoTrim * 100.0);
+			}
+		}
+	}
+
+	*outSampleTime = gAnchorSampleTime;
+	*outHostTime   = gAnchorHostTime;
+	*outSeed       = 1;
 	return 0;
 }
 

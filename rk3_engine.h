@@ -69,6 +69,28 @@
 #define RK3_FRAME_BYTES     512   /* isoc maxPacketSize per microframe */
 #define RK3_XFER_BUF        (RK3_FRAMES_PER_XFER * RK3_FRAME_BYTES)
 #define RK3_FRAME_STRIDE    (RK3_FRAMES_PER_XFER / 8)  /* ms-frames per xfer */
+/*
+ * OUT transfer granularity, split from the IN/global RK3_FRAMES_PER_XFER so the
+ * CAPTURE chain keeps its proven 8 ms cadence while OUT uses smaller transfers to
+ * cut latency (the OUT pipeline is the dominant term). Must DIVIDE
+ * RK3_FRAMES_PER_XFER evenly and not exceed it: the cadence mirror pops one
+ * IN-sized block and feeds it to OUT transfers in RK3_OUT_FRAMES_PER_XFER chunks,
+ * and the shared rk3_iso_xfer arrays are sized for the larger (IN) value.
+ *
+ * 32 (4 ms) halves BOTH the OUT pipeline (N_OUT_XFERS*OUT_STRIDE) and the consumer
+ * bite vs 64. Callback-rate safety (this is what stormed coreaudiod before): OUT
+ * completions = 8000/OUT_FPX per sec; at 32 that's 250/s OUT + 125/s IN = 375/s
+ * total ≈ 1.5x the proven 250/s baseline, far below the ~1000/s (global FPX=16)
+ * that stormed the helper + forced a reboot. Do NOT drop OUT_FPX below 16 without
+ * first proving the sandboxed helper sustains the higher completion rate.
+ */
+#define RK3_OUT_FRAMES_PER_XFER 32
+#define RK3_OUT_XFER_BUF        (RK3_OUT_FRAMES_PER_XFER * RK3_FRAME_BYTES)
+#define RK3_OUT_FRAME_STRIDE    (RK3_OUT_FRAMES_PER_XFER / 8)
+_Static_assert(RK3_FRAMES_PER_XFER % RK3_OUT_FRAMES_PER_XFER == 0,
+	"OUT_FPX must divide FPX evenly (cadence mirror feeds OUT in OUT_FPX chunks)");
+_Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
+	"iso_xfer arrays are sized for FPX; OUT_FPX must not exceed it");
 #define RK3_OUT_MIN_LEAD    24
 #define RK3_PAT_RING        256
 
@@ -86,28 +108,92 @@
 /* OUT 4-byte audio phase (Linux out_pos = BYTES_PER_SAMPLE + 1). DO NOT change. */
 #define RK3_OUT_PHASE       4
 /*
- * Playback cushion (bytes, frame-aligned): the engine sends silence on the OUT
- * pipe until CoreAudio has buffered this much, then starts playout with the read
- * pointer held OUT_PHASE bytes into the audio. The cushion is a STANDING fill of
- * the OUT ring (producer=CoreAudio and consumer=USB are rate-matched), so it is
- * pure added output latency — it must absorb host-thread jitter and host/device
- * clock drift until real device-clock sync exists.
+ * OUT-ring fill control. Two distinct knobs — do not conflate them:
  *
- * Step 5 latency sweep: 4096 (~85 ms) was the glitch-free v1. 768 at N_OUT=4 → 59.8 ms
- * clean; 1024 at N_OUT=3 → 51.7 ms clean. Those were measured with iotest's DEFAULT
- * ~512 host IO buffer, whose 512-frame producer sawtooth dominated the cushion floor.
+ *  - RK3_OUT_CUSHION (bytes, frame-aligned): the INITIAL standing fill the engine
+ *    buffers on the OUT ring before it begins playout (the startup gate in
+ *    write_output, which then seeds pb_r = RK3_OUT_PHASE). Its only job is to
+ *    survive the STARTUP TRANSIENT: for the first ~3 s CoreAudio's producer lags
+ *    the device consumer and the fill dips by ~260 frames (measured at a 64-frame
+ *    host buffer). The cushion must exceed that dip so the ring does not underrun
+ *    before steady state. It does NOT set the steady-state fill.
  *
- * Buffer-size cycle: with a 64-frame host buffer (Reaper-like; iotest --buf 64) the
- * producer becomes smooth, so the floor is set by the CONSUMER bite — fill_out pops one
- * OUT transfer ≈ FRAMES_PER_XFER/8 = 8 ms ≈ 384 frames per out_done. Floor is therefore
- * ~384 + jitter ≈ 512 frames (~11 ms), independent of host buffer. Measured @64-frame
- * buffer, N_OUT=3: 512 → 46.2 ms tight; 384 → 36.75 ms clean but tail widening (mean 40,
- * max 44.5) = nearing the floor. Now probing 320 → if pb_underruns climb, 384 is the
- * floor and we ship that; if still 0, try 256.
- * NOTE: only valid when the host actually uses a small buffer (Reaper 64; NOT the ~512
- * default — at the default this would underrun, so don't ship <768 without confirming).
+ *  - RK3_OUT_FILL_SETPOINT (frames): the STEADY-STATE standing fill, held by the
+ *    driver's rate servo (Drv_GetZeroTimeStamp). This is what actually sets OUT
+ *    latency, and — unlike before — it is STABLE run-to-run.
+ *
+ * History (do not re-derive): before the servo, the steady fill was uncontrolled.
+ * RK3_OUT_CUSHION only seeds the INITIAL value; the steady value was then set by
+ * the startup transient PLUS an unbounded underrun self-heal "balloon" (a stalled
+ * consumer + a still-producing CoreAudio ratchets the fill up and it never comes
+ * back down). That made latency wander 30–69 ms run-to-run; the "30 ms" wins were
+ * lucky runs. The servo fixes this at the root: it trims the perceived device
+ * clock so the average fill converges to the setpoint, draining balloons and
+ * absorbing the ~0.002 % residual drift click-free (no samples added/dropped — the
+ * ring simply holds a different amount). See Drv_GetZeroTimeStamp.
+ *
+ * 512 initial cushion covers the ~260-frame startup dip with margin; the servo
+ * then eases the ring down to RK3_OUT_FILL_SETPOINT.
  */
-#define RK3_OUT_CUSHION     (RK3_BYTES_PER_FRAME * 320)
+#define RK3_OUT_CUSHION       (RK3_BYTES_PER_FRAME * 512)
+/*
+ * Servo steady-state target for the MEAN OUT-ring fill (frames). The hard lower
+ * bound is set by the CONSUMER BITE: each out_done pops a whole 8 ms isoc transfer
+ * (~384 frames at 48 k) out of the ring in one go, while CoreAudio refills it in
+ * small (64-frame) chunks. So the post-pop trough is roughly mean − 384/2 ≈
+ * mean − 192; for the trough to clear zero with jitter margin the MEAN must be
+ * ≳ 256. Telemetry proved this empirically: setpoint 192 (mean below ~256) made
+ * the consumer chronically underrun the remainder of its own bite → 19 underruns
+ * in 20 s and HIGHER latency (self-heal balloons), while ~256 ran clean.
+ *
+ * 272 holds the mean just above the floor (post-pop trough ≈ 80 frames of jitter
+ * margin) → underrun-free and run-to-run stable. ~5.7 ms of OUT ring; the bulk of
+ * the round-trip is the isoc pipeline + safety offset, not this. Going lower
+ * trades clicks for a couple ms (bad for guitar) and the real sub-30 ms lever is
+ * a smaller isoc transfer — which storms the audio subsystem, so it is gated.
+ */
+#define RK3_OUT_FILL_SETPOINT 224
+
+/*
+ * One-time startup drain target for the CAPTURE ring (frames). Capture is the
+ * mirror of the OUT consumer-bite problem: the device delivers a whole IN isoc
+ * transfer (RK3_FRAMES_PER_XFER microframes ≈ 384 frames at 48k) into the ring in
+ * one go while CoreAudio drains it 64 frames at a time, so cap_fill sawtooths ±~192
+ * around its mean. That mean is an uncontrolled startup OFFSET — rates are matched
+ * (the OUT servo trims the shared CoreAudio clock to the device, so the IN side is
+ * rate-matched for free and does NOT self-correct), and telemetry showed it sitting
+ * ~490 frames ≈ 10 ms of hidden INPUT latency. We collapse it ONCE, when playout
+ * begins, down to this setpoint. Floor = the IN producer bite: IN stays at
+ * 64-microframe transfers (shrinking it would raise the isoc callback rate = storm
+ * risk), so the bite is ~384 and the mean must stay ≳ 192 + jitter margin. 256
+ * reclaims ~5 ms. Draining to V leaves the mean ≈ V (the drain instant is a random
+ * phase of the ±192 sawtooth), so the trough lands ≈ V−192; raise V if it underruns.
+ *
+ * TIMING: the fill is NOT established at pb_started (which flips in the first ~100 ms
+ * once the OUT cushion buffers). The device over-delivers during the initial clock
+ * transient (dev_rate 48201 → 48013 over ~1 s), and that excess is what we want to
+ * drop — so the drain waits RK3_CAP_SETTLE_FRAMES after pb_started before measuring.
+ *
+ * TROUGH-TARGETED DRAIN: an earlier version drained "to a setpoint at one instant",
+ * but the drain fired at an arbitrary phase of the ±192 sawtooth, so the resulting
+ * mean was unpredictable (landed ~400 in practice — barely below the ~490 we started
+ * from). Instead, after the settle we MEASURE the windowed minimum of cap_fill over
+ * RK3_CAP_MEASURE_FRAMES (the actual sawtooth TROUGH, post-transient), then drop
+ * exactly (trough − RK3_CAP_FILL_FLOOR) frames once. That lands the steady-state
+ * trough on the floor deterministically, so the mean settles to floor + ~½·bite and
+ * we keep a known underrun margin regardless of phase. Floor is bounded below by the
+ * IN producer bite (~384 frames at 64-microframe transfers): the trough cannot be
+ * pushed under it without input underruns, so RK3_CAP_FILL_FLOOR is the jitter margin
+ * we want to preserve below the trough, not the mean. Watch cap_fill_min in the log
+ * and pb in_errs/underruns; raise the floor if the trough dips toward 0.
+ * Caveat: the drain is a one-time splice (input discontinuity, a single click) ~5.5 s
+ * into the stream. Startup-only; revisit if it bothers recording.
+ */
+#define RK3_CAP_FILL_FLOOR    208
+#define RK3_CAP_SETTLE_FRAMES  (5 * 48000)         /* ~5 s: the IN transient (dev_rate 48200->48013
+                                                    * AND the cap balloon) is still building at 2 s;
+                                                    * measuring then is garbage. Wait it out fully. */
+#define RK3_CAP_MEASURE_FRAMES (48000 / 2)         /* ~0.5 s window to find the (now stable) trough */
 
 struct rk3_engine;
 
@@ -137,6 +223,15 @@ struct rk3_engine {
 	/* capture ring: engine producer (cap_w), caller consumer (cap_r). */
 	uint8_t cap_buf[RK3_RING_BYTES];
 	atomic_uint cap_w, cap_r;
+	atomic_int  cap_primed;    /* 0 until the one-time startup capture drain runs */
+	int         cap_settle_left;  /* frames left to wait post-pb_started before measuring */
+	int         cap_measure_left; /* frames left in the trough-measurement window */
+	unsigned    cap_meas_min;     /* windowed-min cap_fill during measurement (frames) */
+
+	/* windowed-min ring fills (frames), reset each telemetry tick — the true
+	 * sawtooth troughs, i.e. how close each ring gets to underrun. */
+	unsigned    out_fill_min;
+	unsigned    cap_fill_min;
 
 	/* playback ring: caller producer (pb_w), engine consumer (pb_r). */
 	uint8_t pb_buf[RK3_RING_BYTES];
@@ -147,6 +242,11 @@ struct rk3_engine {
 	int pat[RK3_PAT_RING][RK3_FRAMES_PER_XFER];
 	int pat_head, pat_tail;
 	int out_acc;
+	/* Staging block for feeding one IN-sized cadence block to OUT transfers in
+	 * RK3_OUT_FRAMES_PER_XFER chunks. pat_stage_off == RK3_FRAMES_PER_XFER means
+	 * the stage is drained and the next pat_pop_out refills it. */
+	int pat_stage[RK3_FRAMES_PER_XFER];
+	int pat_stage_off;
 
 	/* diagnostics */
 	atomic_uint cap_overruns, pb_underruns, pb_overruns;
@@ -178,5 +278,13 @@ void rk3_engine_stop(struct rk3_engine *e);
  */
 void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes);
 void rk3_engine_write_output(struct rk3_engine *e, const float *src, int nframes);
+
+/*
+ * Current OUT-ring standing fill in stereo frames, or -1 if playout has not
+ * started yet (still in the startup gate). Read by the driver's rate servo
+ * (Drv_GetZeroTimeStamp) to hold the fill at RK3_OUT_FILL_SETPOINT. Safe to call
+ * from the CoreAudio IO thread; reads the same atomics as the float bridges.
+ */
+int rk3_engine_out_fill_frames(struct rk3_engine *e);
 
 #endif /* RK3_ENGINE_H */

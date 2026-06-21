@@ -5,6 +5,9 @@
 #include <os/log.h>
 #include <string.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+#include <mach/thread_act.h>
 
 static os_log_t eng_log(void)
 {
@@ -68,6 +71,24 @@ static void pat_pop(struct rk3_engine *e, int *lens)
 	} else {
 		pat_synth(e, lens);
 	}
+}
+
+/*
+ * Pop one OUT transfer's worth (RK3_OUT_FRAMES_PER_XFER microframes) of cadence,
+ * refilling the IN-sized staging block as it drains. RK3_OUT_FRAMES_PER_XFER
+ * divides RK3_FRAMES_PER_XFER, so each captured IN block feeds an exact integer
+ * number of OUT transfers — the OUT chain stays rate-locked to the device clock
+ * even though it ships smaller transfers than capture.
+ */
+static void pat_pop_out(struct rk3_engine *e, int *lens)
+{
+	if (e->pat_stage_off >= RK3_FRAMES_PER_XFER) {
+		pat_pop(e, e->pat_stage);
+		e->pat_stage_off = 0;
+	}
+	for (int f = 0; f < RK3_OUT_FRAMES_PER_XFER; f++)
+		lens[f] = e->pat_stage[e->pat_stage_off + f];
+	e->pat_stage_off += RK3_OUT_FRAMES_PER_XFER;
 }
 
 /* ---- isoc completion callbacks (ported from stream.c) ---------------- */
@@ -145,15 +166,15 @@ static void in_done(void *refcon, IOReturn result, void *arg0)
  */
 static void fill_out(struct rk3_engine *e, struct rk3_iso_xfer *x)
 {
-	int lens[RK3_FRAMES_PER_XFER];
-	pat_pop(e, lens);
+	int lens[RK3_OUT_FRAMES_PER_XFER];
+	pat_pop_out(e, lens);
 
-	if (lens[RK3_FRAMES_PER_XFER - 1] == 0) {
-		int j = RK3_FRAMES_PER_XFER - 2;
+	if (lens[RK3_OUT_FRAMES_PER_XFER - 1] == 0) {
+		int j = RK3_OUT_FRAMES_PER_XFER - 2;
 		while (j >= 0 && lens[j] == 0)
 			j--;
 		if (j >= 0) {
-			lens[RK3_FRAMES_PER_XFER - 1] = lens[j];
+			lens[RK3_OUT_FRAMES_PER_XFER - 1] = lens[j];
 			lens[j] = 0;
 		}
 	}
@@ -164,7 +185,7 @@ static void fill_out(struct rk3_engine *e, struct rk3_iso_xfer *x)
 	unsigned avail = started ? ring_avail(w, r) : 0;
 
 	int off = 0;
-	for (int f = 0; f < RK3_FRAMES_PER_XFER; f++) {
+	for (int f = 0; f < RK3_OUT_FRAMES_PER_XFER; f++) {
 		int len = lens[f];
 		if (len > RK3_FRAME_BYTES) len = RK3_FRAME_BYTES;
 		x->frames[f].frReqCount = len;
@@ -188,8 +209,14 @@ static void fill_out(struct rk3_engine *e, struct rk3_iso_xfer *x)
 		}
 		off += len;
 	}
-	if (started)
+	if (started) {
 		atomic_store_explicit(&e->pb_r, r, memory_order_release);
+		/* windowed-min out_fill telemetry: post-consume trough (this is the
+		 * sample right after the OUT bite, i.e. closest to underrun). */
+		unsigned wf = atomic_load_explicit(&e->pb_w, memory_order_relaxed);
+		unsigned of = ring_avail(wf, r) / RK3_BYTES_PER_FRAME;
+		if (of < e->out_fill_min) e->out_fill_min = of;
+	}
 }
 
 static int submit_out(struct rk3_iso_xfer *x)
@@ -198,7 +225,7 @@ static int submit_out(struct rk3_iso_xfer *x)
 	for (int tries = 0; tries < 8; tries++) {
 		IOReturn kr = (*e->usb.intf)->WriteIsochPipeAsync(e->usb.intf,
 				e->usb.pipe_iso_out, x->buf, x->frame_start,
-				RK3_FRAMES_PER_XFER, x->frames, out_done, x);
+				RK3_OUT_FRAMES_PER_XFER, x->frames, out_done, x);
 		if (kr == kIOReturnSuccess)
 			return 0;
 		e->out_errs++;
@@ -207,7 +234,7 @@ static int submit_out(struct rk3_iso_xfer *x)
 		(*e->usb.intf)->GetBusFrameNumber(e->usb.intf, &cur, &at);
 		UInt64 floor = cur + RK3_OUT_MIN_LEAD;
 		x->frame_start = (x->frame_start < floor)
-				 ? floor : x->frame_start + RK3_FRAME_STRIDE;
+				 ? floor : x->frame_start + RK3_OUT_FRAME_STRIDE;
 	}
 	e->out_drops++;
 	return -1;
@@ -220,23 +247,25 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 	(void)result; (void)arg0;
 	if (!atomic_load_explicit(&e->running, memory_order_acquire))
 		return;
-	x->frame_start += (UInt64)RK3_N_OUT_XFERS * RK3_FRAME_STRIDE;
+	x->frame_start += (UInt64)RK3_N_OUT_XFERS * RK3_OUT_FRAME_STRIDE;
 	fill_out(e, x);
 	submit_out(x);
 
 	/*
-	 * Drift-vs-jitter probe. out_done fires once per FRAME_STRIDE ms-frame (~8ms,
-	 * 125/sec) regardless of N_OUT_XFERS, so tick every 125 calls ≈ 1 second. Log
-	 * the OUT ring fill level (instantaneous) and the CUMULATIVE measured device
-	 * rate from a FIXED anchor (converges as the run lengthens — needed to resolve
-	 * a 0.01% drift). Monotonic fill decline => drift (clock sync is the fix); fill
-	 * noisy around a stable mean with underruns jumping on dips => jitter/margin.
+	 * Drift-vs-jitter probe. out_done fires once per OUT transfer (every
+	 * RK3_OUT_FRAME_STRIDE ms-frame = 8000/RK3_OUT_FRAMES_PER_XFER per sec)
+	 * regardless of N_OUT_XFERS, so tick every (8000/OUT_FPX) calls ≈ 1 second. Log
+	 * the OUT ring fill, the CAPTURE ring fill (so we catch a silent input-latency
+	 * balloon — the IN ring growing if CoreAudio drains it slower than the device
+	 * fills it), and the CUMULATIVE measured device rate from a FIXED anchor
+	 * (converges as the run lengthens). Monotonic out_fill decline => drift; noisy
+	 * around a stable mean with underruns on dips => jitter/margin.
 	 */
 	if (e->dbg_host0 == 0) {
 		e->dbg_host0 = mach_absolute_time();
 		e->dbg_devframes0 = atomic_load_explicit(&e->dev_frames, memory_order_relaxed);
 	}
-	if (++e->dbg_ctr >= 125) {
+	if (++e->dbg_ctr >= (unsigned)(8000 / RK3_OUT_FRAMES_PER_XFER)) {
 		e->dbg_ctr = 0;
 		static mach_timebase_info_data_t tb;
 		if (tb.denom == 0) mach_timebase_info(&tb);
@@ -245,11 +274,18 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 		unsigned w = atomic_load_explicit(&e->pb_w, memory_order_acquire);
 		unsigned r = atomic_load_explicit(&e->pb_r, memory_order_relaxed);
 		unsigned fill = ring_avail(w, r) / RK3_BYTES_PER_FRAME;
+		unsigned cw = atomic_load_explicit(&e->cap_w, memory_order_acquire);
+		unsigned cr = atomic_load_explicit(&e->cap_r, memory_order_relaxed);
+		unsigned capfill = ring_avail(cw, cr) / RK3_BYTES_PER_FRAME;
 		unsigned long long df = atomic_load_explicit(&e->dev_frames, memory_order_relaxed);
 		double rate = elapsed_s > 0 ?
 			(double)(df - e->dbg_devframes0) / elapsed_s : 0.0;
-		ELOG("clk: fill=%u frames  dev_rate=%.2f Hz (nominal %d)  underruns=%u",
-		     fill, rate, e->rate, atomic_load(&e->pb_underruns));
+		unsigned ofmin = e->out_fill_min, cfmin = e->cap_fill_min;
+		e->out_fill_min = ~0u;
+		e->cap_fill_min = ~0u;
+		ELOG("clk: out_fill=%u (min %u) cap_fill=%u (min %u)  dev_rate=%.2f Hz (nominal %d)  underruns=%u",
+		     fill, ofmin == ~0u ? 0 : ofmin, capfill, cfmin == ~0u ? 0 : cfmin,
+		     rate, e->rate, atomic_load(&e->pb_underruns));
 	}
 }
 
@@ -301,17 +337,43 @@ static void prime_chains(struct rk3_engine *e)
 	for (int i = 0; i < RK3_N_OUT_XFERS; i++) {
 		e->out[i].e = e;
 		e->out[i].index = i;
-		e->out[i].frame_start = start + (UInt64)i * RK3_FRAME_STRIDE;
+		e->out[i].frame_start = start + (UInt64)i * RK3_OUT_FRAME_STRIDE;
 		fill_out(e, &e->out[i]);
 		if (submit_out(&e->out[i]) != 0)
 			ELOG("prime OUT %d failed", i);
 	}
 }
 
+/*
+ * Promote the engine's USB/CFRunLoop thread to time-constraint (real-time)
+ * scheduling so isoc completion callbacks are serviced on time even under DAW
+ * load. Insurance for the smaller OUT transfers (higher completion rate): the
+ * storm risk is a default-priority thread falling behind the completion stream.
+ * preemptible=1 so we still yield to CoreAudio's own real-time IO thread.
+ * Best-effort; a failure here is non-fatal (logged, engine runs default-sched).
+ */
+static void engine_set_realtime(void)
+{
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	double abs_per_ms = 1e6 * (double)tb.denom / (double)tb.numer;
+	thread_time_constraint_policy_data_t pol;
+	pol.period      = 0;                              /* aperiodic (event-driven) */
+	pol.computation = (uint32_t)(0.5 * abs_per_ms);  /* ~0.5 ms to service a cb */
+	pol.constraint  = (uint32_t)(2.0 * abs_per_ms);  /* deadline ~2 ms */
+	pol.preemptible = 1;
+	kern_return_t kr = thread_policy_set(mach_thread_self(),
+			THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol,
+			THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+	if (kr != KERN_SUCCESS)
+		ELOG("thread_policy_set RT failed: 0x%x", kr);
+}
+
 static void *engine_thread(void *arg)
 {
 	struct rk3_engine *e = arg;
 	e->runloop = CFRunLoopGetCurrent();
+	engine_set_realtime();
 
 	CFRunLoopSourceRef src = NULL;
 	IOReturn kr = (*e->usb.intf)->CreateInterfaceAsyncEventSource(e->usb.intf, &src);
@@ -355,6 +417,7 @@ int rk3_engine_start(struct rk3_engine *e, int rate)
 	atomic_store(&e->thread_ready, 0);
 	e->rate = rate;
 	e->pat_head = e->pat_tail = e->out_acc = 0;
+	e->pat_stage_off = RK3_FRAMES_PER_XFER;   /* force a pop on first OUT fill */
 	e->in_errs = e->out_errs = e->out_drops = 0;
 
 	if (rk3_usb_open(&e->usb) != 0)
@@ -384,6 +447,12 @@ int rk3_engine_start(struct rk3_engine *e, int rate)
 	 */
 	atomic_store(&e->cap_w, 0);
 	atomic_store(&e->cap_r, 0);
+	atomic_store(&e->cap_primed, 0);
+	e->cap_settle_left = RK3_CAP_SETTLE_FRAMES;
+	e->cap_measure_left = RK3_CAP_MEASURE_FRAMES;
+	e->cap_meas_min = ~0u;
+	e->out_fill_min = ~0u;
+	e->cap_fill_min = ~0u;
 	atomic_store(&e->pb_w, 0);
 	atomic_store(&e->pb_r, 0);
 	atomic_store(&e->pb_started, 0);
@@ -444,7 +513,39 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 	int need = nframes * RK3_BYTES_PER_FRAME;
 	unsigned r = atomic_load_explicit(&e->cap_r, memory_order_relaxed);
 	unsigned w = atomic_load_explicit(&e->cap_w, memory_order_acquire);
+
+	/*
+	 * One-time startup capture drain. The capture standing fill is an uncontrolled
+	 * startup offset (~490 frames ≈ 10 ms of hidden input latency) that the device's
+	 * initial clock transient builds up over the first ~1 s — so we cannot drain at
+	 * pb_started (too early, fill not yet established). Wait RK3_CAP_SETTLE_FRAMES
+	 * past pb_started, then collapse the fill to RK3_CAP_FILL_SETPOINT once. The
+	 * dropped amount is a frame multiple, so cap_r stays frame-aligned. Runs exactly
+	 * once (cap_primed). read_input is the sole cap_r writer, so this is SPSC-safe.
+	 */
+	if (!atomic_load_explicit(&e->cap_primed, memory_order_relaxed) &&
+	    atomic_load_explicit(&e->pb_started, memory_order_acquire)) {
+		if (e->cap_settle_left > 0) {
+			e->cap_settle_left -= nframes;   /* wait out the IN startup transient */
+		} else if (e->cap_measure_left > 0) {
+			unsigned hf = ring_avail(w, r) / RK3_BYTES_PER_FRAME;
+			if (hf < e->cap_meas_min) e->cap_meas_min = hf;  /* find the trough */
+			e->cap_measure_left -= nframes;
+		} else {
+			if (e->cap_meas_min != ~0u && e->cap_meas_min > RK3_CAP_FILL_FLOOR) {
+				unsigned drop = (e->cap_meas_min - RK3_CAP_FILL_FLOOR)
+						* RK3_BYTES_PER_FRAME;
+				r = (r + drop) % RK3_RING_BYTES;   /* trough -> floor */
+			}
+			atomic_store_explicit(&e->cap_primed, 1, memory_order_relaxed);
+		}
+	}
+
 	unsigned avail = ring_avail(w, r);
+	{                                   /* windowed-min cap_fill telemetry */
+		unsigned af = avail / RK3_BYTES_PER_FRAME;
+		if (af < e->cap_fill_min) e->cap_fill_min = af;
+	}
 	int got = (avail < (unsigned)need) ? (int)avail : need;
 	got -= got % RK3_BYTES_PER_FRAME;
 
@@ -486,4 +587,13 @@ void rk3_engine_write_output(struct rk3_engine *e, const float *src, int nframes
 		atomic_store_explicit(&e->pb_r, RK3_OUT_PHASE, memory_order_relaxed);
 		atomic_store_explicit(&e->pb_started, 1, memory_order_release);
 	}
+}
+
+int rk3_engine_out_fill_frames(struct rk3_engine *e)
+{
+	if (!atomic_load_explicit(&e->pb_started, memory_order_acquire))
+		return -1;
+	unsigned w = atomic_load_explicit(&e->pb_w, memory_order_acquire);
+	unsigned r = atomic_load_explicit(&e->pb_r, memory_order_relaxed);
+	return (int)(ring_avail(w, r) / RK3_BYTES_PER_FRAME);
 }
