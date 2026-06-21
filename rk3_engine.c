@@ -4,6 +4,7 @@
 
 #include <os/log.h>
 #include <string.h>
+#include <mach/mach_time.h>
 
 static os_log_t eng_log(void)
 {
@@ -107,6 +108,9 @@ static void in_done(void *refcon, IOReturn result, void *arg0)
 				    scratch, &pos, sizeof(scratch));
 	}
 	if (pos > 0) {
+		/* device clock: count frames actually produced, even if the ring drops them */
+		atomic_fetch_add_explicit(&e->dev_frames,
+				(unsigned)(pos / RK3_BYTES_PER_FRAME), memory_order_relaxed);
 		unsigned w = atomic_load_explicit(&e->cap_w, memory_order_relaxed);
 		unsigned r = atomic_load_explicit(&e->cap_r, memory_order_acquire);
 		if (ring_space(w, r) < (unsigned)pos) {
@@ -219,6 +223,34 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 	x->frame_start += (UInt64)RK3_N_OUT_XFERS * RK3_FRAME_STRIDE;
 	fill_out(e, x);
 	submit_out(x);
+
+	/*
+	 * Drift-vs-jitter probe. out_done fires once per FRAME_STRIDE ms-frame (~8ms,
+	 * 125/sec) regardless of N_OUT_XFERS, so tick every 125 calls ≈ 1 second. Log
+	 * the OUT ring fill level (instantaneous) and the CUMULATIVE measured device
+	 * rate from a FIXED anchor (converges as the run lengthens — needed to resolve
+	 * a 0.01% drift). Monotonic fill decline => drift (clock sync is the fix); fill
+	 * noisy around a stable mean with underruns jumping on dips => jitter/margin.
+	 */
+	if (e->dbg_host0 == 0) {
+		e->dbg_host0 = mach_absolute_time();
+		e->dbg_devframes0 = atomic_load_explicit(&e->dev_frames, memory_order_relaxed);
+	}
+	if (++e->dbg_ctr >= 125) {
+		e->dbg_ctr = 0;
+		static mach_timebase_info_data_t tb;
+		if (tb.denom == 0) mach_timebase_info(&tb);
+		UInt64 now = mach_absolute_time();
+		double elapsed_s = (double)(now - e->dbg_host0) * tb.numer / tb.denom / 1e9;
+		unsigned w = atomic_load_explicit(&e->pb_w, memory_order_acquire);
+		unsigned r = atomic_load_explicit(&e->pb_r, memory_order_relaxed);
+		unsigned fill = ring_avail(w, r) / RK3_BYTES_PER_FRAME;
+		unsigned long long df = atomic_load_explicit(&e->dev_frames, memory_order_relaxed);
+		double rate = elapsed_s > 0 ?
+			(double)(df - e->dbg_devframes0) / elapsed_s : 0.0;
+		ELOG("clk: fill=%u frames  dev_rate=%.2f Hz (nominal %d)  underruns=%u",
+		     fill, rate, e->rate, atomic_load(&e->pb_underruns));
+	}
 }
 
 static void resubmit_in(struct rk3_iso_xfer *x)

@@ -202,6 +202,7 @@ static volatile int    g_lat_n = 0;
 static volatile int    g_lat_emitted = 0;          /* impulses sent on output */
 static volatile float  g_lat_inpeak = 0.0f;        /* max |input| seen (any chan) */
 
+static UInt32 g_lat_bufsize = 64;   /* IO buffer frames (Reaper-like; --buf N) */
 static AudioUnit g_lat_au;          /* single full-duplex unit */
 static AudioBufferList *g_lat_inlist;
 
@@ -289,6 +290,15 @@ static int run_latency(AudioDeviceID dev, double seconds)
 	/* output (elem 0) is enabled by default on a HALOutput unit */
 	AudioUnitSetProperty(g_lat_au, kAudioOutputUnitProperty_CurrentDevice,
 			kAudioUnitScope_Global, 0, &dev, sizeof(dev));
+	/* Match Reaper's small IO buffer (cushion floor ~= buffer size). */
+	AudioObjectPropertyAddress bfa = { kAudioDevicePropertyBufferFrameSize,
+			kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+	if (AudioObjectSetPropertyData(dev, &bfa, 0, NULL,
+			sizeof(g_lat_bufsize), &g_lat_bufsize) != noErr)
+		fprintf(stderr, "warn: could not set buffer frame size %u\n", g_lat_bufsize);
+	UInt32 actual = 0, asz = sizeof(actual);
+	AudioObjectGetPropertyData(dev, &bfa, 0, NULL, &asz, &actual);
+	printf("IO buffer = %u frames\n", actual);
 	/* output side: format we feed (input scope, elem 0) */
 	AudioUnitSetProperty(g_lat_au, kAudioUnitProperty_StreamFormat,
 			kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
@@ -360,6 +370,8 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--in") == 0) do_input = 1;
 		else if (strcmp(argv[i], "--latency") == 0) do_latency = 1;
+		else if (strcmp(argv[i], "--buf") == 0 && i + 1 < argc)
+			g_lat_bufsize = (UInt32)atoi(argv[++i]);
 		else seconds = atof(argv[i]);
 	}
 

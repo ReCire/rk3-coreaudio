@@ -40,10 +40,15 @@
  * ahead). Reducing this is the SAFE latency lever: it does NOT change the isoc
  * completion rate (so no extra helper load, unlike shrinking FRAMES_PER_XFER) and
  * worst case is an underrun, not a coreaudiod storm. 8 (64ms) was bring-up; Step 5
- * tries 4 (32ms pipeline). Floor is ~2-3 for glitch-free double/triple buffering;
- * if pb_underruns/out_errs climb in `make driver-log`, step back up.
+ * tries 4 (32ms pipeline). Floor is 2 (double-buffer minimum; 1 can't refill in flight).
+ * Sweep @64-frame buffer / cushion 320: N_OUT=3 → 35.5ms; N_OUT=2 → 30.0ms, pb_underruns=0
+ * over 8s (clean, tight). N_OUT=2 is the resilience floor (8ms refill window, no margin for
+ * helper stalls under real DAW load) — validate under Reaper load before trusting it; revert
+ * to 3 if it glitches. NOTE: at cushion 320 the ~0.01% host/device drift drains the ring in
+ * ~67s, so without device-clock sync this config drift-glitches ~once/min (an 8s test can't
+ * see it). Clock sync is the prerequisite for shipping this aggressive config.
  */
-#define RK3_N_OUT_XFERS     3
+#define RK3_N_OUT_XFERS     2
 /*
  * Microframes per transfer (8 microframes = 1 ms). This is the isoc granularity
  * and the dominant latency lever: the OUT pipeline = N_OUT_XFERS * FRAMES_PER_XFER/8
@@ -88,14 +93,21 @@
  * pure added output latency — it must absorb host-thread jitter and host/device
  * clock drift until real device-clock sync exists.
  *
- * Step 5 latency sweep: 4096 frames (~85 ms) was the glitch-free v1 value. 512
- * frames (~10.7 ms) measured 51.9 ms round-trip but with pb_underruns=27/8s under
- * full-duplex load (N_OUT_XFERS=4) — audible clicks. 768 (~16 ms) at N_OUT_XFERS=4
- * measured 59.8 ms, pb_underruns=0 (clean). Now probing N_OUT_XFERS=3 (pipeline
- * 32→24 ms) which needs more standing fill to stay glitch-free, so 1024 (~21 ms).
- * If pb_underruns return, N_OUT_XFERS=3 is past the floor — revert to 4 / cushion 768.
+ * Step 5 latency sweep: 4096 (~85 ms) was the glitch-free v1. 768 at N_OUT=4 → 59.8 ms
+ * clean; 1024 at N_OUT=3 → 51.7 ms clean. Those were measured with iotest's DEFAULT
+ * ~512 host IO buffer, whose 512-frame producer sawtooth dominated the cushion floor.
+ *
+ * Buffer-size cycle: with a 64-frame host buffer (Reaper-like; iotest --buf 64) the
+ * producer becomes smooth, so the floor is set by the CONSUMER bite — fill_out pops one
+ * OUT transfer ≈ FRAMES_PER_XFER/8 = 8 ms ≈ 384 frames per out_done. Floor is therefore
+ * ~384 + jitter ≈ 512 frames (~11 ms), independent of host buffer. Measured @64-frame
+ * buffer, N_OUT=3: 512 → 46.2 ms tight; 384 → 36.75 ms clean but tail widening (mean 40,
+ * max 44.5) = nearing the floor. Now probing 320 → if pb_underruns climb, 384 is the
+ * floor and we ship that; if still 0, try 256.
+ * NOTE: only valid when the host actually uses a small buffer (Reaper 64; NOT the ~512
+ * default — at the default this would underrun, so don't ship <768 without confirming).
  */
-#define RK3_OUT_CUSHION     (RK3_BYTES_PER_FRAME * 1024)
+#define RK3_OUT_CUSHION     (RK3_BYTES_PER_FRAME * 320)
 
 struct rk3_engine;
 
@@ -139,6 +151,13 @@ struct rk3_engine {
 	/* diagnostics */
 	atomic_uint cap_overruns, pb_underruns, pb_overruns;
 	int in_errs, out_errs, out_drops;
+
+	/* clock/fill telemetry: total stereo frames captured (device clock), and a
+	 * once-per-second log tick of the OUT ring fill level (drift vs jitter probe). */
+	atomic_ullong dev_frames;
+	unsigned dbg_ctr;
+	UInt64 dbg_host0;
+	unsigned long long dbg_devframes0;
 };
 
 /*

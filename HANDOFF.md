@@ -25,11 +25,39 @@ Plan file: `/Users/mihai/.claude/plans/this-folder-contains-the-jolly-beacon.md`
   - Architecture: `rk3_engine.{h,c}` (USB+isoc on its own thread, SPSC rings) + `plugin/
     rk3_device.c` (HAL object model, Float32<->S24_3BE bridges). Build/install:
     `make driver` / `make install-driver` (sudo) / `make driver-log`.
-  - **STEP 5 LATENCY TUNING DONE (2026-06-21): 81.5 → 51.7 ms round-trip, glitch-free**, via
-    `RK3_N_OUT_XFERS=3` + `RK3_OUT_CUSHION=6*1024` (measured by `iotest --latency` loopback).
-    Parameter shaving exhausted; further cuts need device-clock sync. See Step 5 section.
-  - Remaining for later: real Reaper guitar play-test, device-clock sync (would shrink the
-    drift cushion = the next real latency lever), multi-rate (only 48 kHz now), CoreMIDI bundle.
+  - **STEP 5 LATENCY TUNING (2026-06-21): 81.5 ms → ~30 ms round-trip best case**, via the
+    buffer-size discovery (below) + `RK3_N_OUT_XFERS=2` + `RK3_OUT_CUSHION=6*320`. BUT latency is
+    currently UNSTABLE run-to-run (30–69 ms) — see "OUT-fill instability" below. NEXT TASK = a
+    FILL SERVO to make it stable+low. See Step 5 section.
+  - Remaining for later: a FILL SERVO (the real next task — see below), real Reaper guitar
+    play-test, multi-rate (only 48 kHz now), CoreMIDI bundle.
+
+  - **⚠️ NEXT-AGENT START HERE — two big findings after the 51.7 ms "ship" claim below, which
+    is now SUPERSEDED:**
+    1. **Buffer-size breakthrough.** The cushion floor was being set by the HOST IO BUFFER size,
+       not by drift. `iotest` had defaulted to CoreAudio's ~512-frame buffer; Reaper uses 64.
+       Added `iotest --buf N` (default 64). With a small/smooth producer the floor becomes the
+       CONSUMER bite (`fill_out` pops ~1 OUT transfer ≈ 8 ms ≈ 384 frames per `out_done`).
+       Sweep @64-frame buffer, N_OUT=3: cushion 512→46.2 ms, 384→36.75 ms, 320→35.5 ms; then
+       N_OUT=2/cushion 320 → **30.0 ms**, pb_underruns=0 over 8 s. Current shipped constants now
+       reflect this (N_OUT=2, cushion 320). **Only valid when the host uses a small buffer** —
+       at the ~512 default this underruns, so do NOT ship <768 without confirming Reaper's 64.
+    2. **DRIFT HYPOTHESIS OVERTURNED — DO NOT BUILD CLOCK SYNC as a latency fix.** Added
+       telemetry (a `dev_frames` device-clock counter + a once/sec `clk:` log of OUT ring fill)
+       and ran a 90 s loopback. Result: `dev_rate ≈ 47999 Hz` = only ~0.002 % off nominal
+       (negligible; ~25 min to drain the cushion, NOT ~once/min). So the comments below that say
+       "clock sync is the prerequisite" / "drift drains the ring in ~67 s" are WRONG — ignore.
+    3. **The REAL problem = OUT-fill INSTABILITY.** The 90 s telemetry showed: fill seeds ~320,
+       a startup transient drops it to ~54 in ~3 s → bottoms out → 2 underruns → the underrun
+       self-heal then BALLOONS the standing fill to ~1550 frames, where it sits stable for the
+       rest of the run (→ 69 ms median that run). `RK3_OUT_CUSHION` only sets the INITIAL fill,
+       NOT the steady state — so the "30 ms" / "51.7 ms" wins were LUCKY runs. True latency is
+       unstable 30–69 ms run-to-run.
+    4. **THE FIX (next task) = a FILL SERVO.** Hold the OUT standing fill at a low setpoint by
+       trimming the output clock RATE via the `Drv_GetZeroTimeStamp` slope in `plugin/rk3_device.c`
+       (click-free; also absorbs the tiny residual drift for free). Alternative/complement: bound
+       the self-heal balloon in `fill_out` (rk3_engine.c). Telemetry (`dev_frames`, `clk:` log)
+       is left INSTALLED in the engine to tune the servo — remove once done.
 
 ### Pre-Step-4 standalone-harness validation (tools/stream.c, still true)
 
