@@ -1,0 +1,8 @@
+# build artifacts (build/ is root-owned from `sudo make install-driver`)
+build/
+
+# generated audio captures
+*.wav
+
+# macOS
+.DS_Store

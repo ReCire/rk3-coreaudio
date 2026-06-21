@@ -1,0 +1,146 @@
+/* caiaq_protocol.c — see caiaq_protocol.h */
+
+#include "caiaq_protocol.h"
+
+#include <stdio.h>
+#include <string.h>
+
+/* Matches CLOCK_DRIFT_TOLERANCE / CHANNELS_PER_STREAM / sample sizing in audio.c. */
+#define CLOCK_DRIFT_TOLERANCE 5
+#define CHANNELS_PER_STREAM   2
+#define BYTES_PER_SAMPLE      3
+#define MAX_ENDPOINT_SIZE     512
+
+int caiaq_send_command(struct rk3_usb *u, uint8_t command,
+		       const uint8_t *buffer, int len)
+{
+	uint8_t out[EP1_BUFSIZE];
+
+	if (len > EP1_BUFSIZE - 1)
+		len = EP1_BUFSIZE - 1;
+
+	out[0] = command;
+	if (buffer && len > 0)
+		memcpy(out + 1, buffer, len);
+
+	return rk3_bulk_write(u, out, len + 1, 200);
+}
+
+/*
+ * Read EP1 IN until we see a reply whose first byte == want_cmd, or we run
+ * out of attempts. The device may interleave unsolicited messages (MIDI,
+ * analog/ERP) once auto-messages are on, so we filter by command byte.
+ */
+static int read_reply(struct rk3_usb *u, uint8_t want_cmd,
+		      uint8_t *buf, size_t cap, size_t *out_len)
+{
+	for (int attempt = 0; attempt < 16; attempt++) {
+		size_t len = cap;
+		int rc = rk3_bulk_read(u, buf, &len, 500);
+		if (rc == RK3_ETIMEOUT)
+			return -1; /* device went quiet */
+		if (rc != 0)
+			return -1;
+		if (len >= 1 && buf[0] == want_cmd) {
+			*out_len = len;
+			return 0;
+		}
+		/* else: unsolicited message, keep reading */
+	}
+	return -1;
+}
+
+int caiaq_get_device_info(struct rk3_usb *u, struct caiaq_device_spec *spec)
+{
+	uint8_t buf[EP1_BUFSIZE];
+	size_t len = 0;
+	int rc;
+
+	rc = caiaq_send_command(u, EP1_CMD_GET_DEVICE_INFO, NULL, 0);
+	if (rc != 0)
+		return rc;
+
+	rc = read_reply(u, EP1_CMD_GET_DEVICE_INFO, buf, sizeof(buf), &len);
+	if (rc != 0) {
+		fprintf(stderr, "caiaq_get_device_info: no reply\n");
+		return -1;
+	}
+
+	if (len < 1 + sizeof(*spec)) {
+		fprintf(stderr, "caiaq_get_device_info: short reply (%zu bytes)\n",
+			len);
+		return -1;
+	}
+
+	/* Payload starts at buf[1]; struct is packed and matches wire layout. */
+	memcpy(spec, buf + 1, sizeof(*spec));
+	/* fw_version is little-endian on the wire; macOS arm64 is LE too. */
+	return 0;
+}
+
+int caiaq_compute_bpp(int rate, int data_alignment, int n_streams)
+{
+	int bytes_per_sample = BYTES_PER_SAMPLE;
+	int bpp;
+
+	if (data_alignment >= 2)
+		bytes_per_sample++;
+
+	bpp = ((rate / 8000) + CLOCK_DRIFT_TOLERANCE)
+		* bytes_per_sample * CHANNELS_PER_STREAM * n_streams;
+
+	if (bpp > MAX_ENDPOINT_SIZE)
+		bpp = MAX_ENDPOINT_SIZE;
+
+	return bpp;
+}
+
+int caiaq_set_audio_params(struct rk3_usb *u, int rate, int depth, int bpp)
+{
+	uint8_t tmp[5];
+	uint8_t buf[EP1_BUFSIZE];
+	size_t len = 0;
+	int rc;
+
+	switch (rate) {
+	case 44100:  tmp[0] = CAIAQ_SR_44100;  break;
+	case 48000:  tmp[0] = CAIAQ_SR_48000;  break;
+	case 88200:  tmp[0] = CAIAQ_SR_88200;  break;
+	case 96000:  tmp[0] = CAIAQ_SR_96000;  break;
+	case 192000: tmp[0] = CAIAQ_SR_192000; break;
+	default:
+		fprintf(stderr, "caiaq_set_audio_params: bad rate %d\n", rate);
+		return -1;
+	}
+
+	switch (depth) {
+	case 16: tmp[1] = CAIAQ_DEPTH_16; break;
+	case 24: tmp[1] = CAIAQ_DEPTH_24; break;
+	default:
+		fprintf(stderr, "caiaq_set_audio_params: bad depth %d\n", depth);
+		return -1;
+	}
+
+	tmp[2] = bpp & 0xff;
+	tmp[3] = (bpp >> 8) & 0xff;
+	tmp[4] = 1; /* packets per microframe */
+
+	rc = caiaq_send_command(u, EP1_CMD_AUDIO_PARAMS, tmp, sizeof(tmp));
+	if (rc != 0)
+		return rc;
+
+	rc = read_reply(u, EP1_CMD_AUDIO_PARAMS, buf, sizeof(buf), &len);
+	if (rc != 0) {
+		fprintf(stderr, "caiaq_set_audio_params: no ack\n");
+		return -1;
+	}
+
+	/* buf[1] is the answer byte; 1 == accepted (device.c:303). */
+	if (len < 2 || buf[1] != 1) {
+		fprintf(stderr, "caiaq_set_audio_params: device rejected "
+			"(answer=%d)\n", len >= 2 ? buf[1] : -1);
+		return -1;
+	}
+
+	return 0;
+}
