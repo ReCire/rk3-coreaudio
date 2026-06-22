@@ -8,6 +8,51 @@ NOT need them to start, but `HANDOFF.md` "Step 5" has the full latency-tuning hi
 
 ---
 
+## STATUS — 2026-06-22: campaign essentially COMPLETE (14.31 ms, Reaper-validated)
+
+This pass took round-trip from **23.66 ms → 14.31 ms** (loopback `iotest`), and the user
+confirmed **~10–15 ms in Reaper under real plugin load, clean**. The transport
+small-transfer levers are now **exhausted** — read this before re-opening the plan below.
+
+**Final shipped config** (`rk3_engine.h`): `RK3_FRAMES_PER_XFER=32` (IN, 250/s),
+`RK3_OUT_FRAMES_PER_XFER=16` (OUT, 500/s) → **750/s total callback rate**,
+`RK3_CAP_FILL_FLOOR=140`, `RK3_N_OUT_XFERS=2`, `RK3_USE_LOWLAT=0` (basic path).
+`kSafetyOffsetFrames=256`. Progression, all `underruns=0`:
+
+| Step | Change | Round-trip | Rate |
+|------|--------|-----------|------|
+| baseline | FPX=64 | 23.66 ms | 375/s |
+| #2 | IN FPX 64→32 | 19.79 ms | 500/s |
+| #3 | cap-floor 208→140 | 16.98 ms | 500/s |
+| #4 | OUT_FPX 32→16 | **14.31 ms** | 750/s |
+
+**Key results that close out the plan in §2/§3 below:**
+- **§3-A (low-latency isoch API) is a DEAD END on Apple Silicon.** The LL path was fully
+  ported (gated behind `RK3_USE_LOWLAT`, still in `rk3_engine.c`) and proven 1:1-equivalent
+  to the basic API. `updateFrequency` is a **NO-OP**: IOUSBLib is a shim over
+  IOUSBHost/DriverKit that copies the frame list only AT COMPLETION — no mid-flight
+  microframe status. So LL does NOT dissolve the callback-rate storm wall NI's Intel kext
+  relied on. **Smaller transfers are the only real lever, and they are now maxed out.**
+- **Storm ceiling re-mapped:** 375/500/750 per-sec callback rates all PROVEN SAFE this pass
+  (750 over a 10 s bench + a multi-minute Reaper session). ~1000/s (global FPX=16) is still
+  PROVEN FATAL (reboot). OUT_FPX cannot go below 16 (static asserts forbid it at IN FPX=32).
+- The earlier "FPX=64→16 stormed" wall (§1.55 #1) was a **global** FPX=16 (~1000/s); the
+  win here was lowering IN and OUT *separately* to land at 750/s, under that ceiling.
+
+**What's left (all optional, confirm with user before starting):**
+1. **Hardware direct monitoring** (`setDirectMonitoringMode`, EP1 cmd `0x0e`) — the only
+   path to *near-zero* monitoring latency for live guitar (bypasses the host loop entirely).
+   Payload not yet captured; needs more RE. This is the real sub-10 ms answer.
+2. Marginal: `RK3_CAP_FILL_FLOOR` 140→~120 (~0.4 ms, trough margin already only ~80 frames
+   — risky, not worth it) or re-sweep `RK3_N_OUT_XFERS` (already at the 2 knee).
+3. If 750/s ever proves flaky on the user's machine under heavier load: revert
+   `RK3_OUT_FRAMES_PER_XFER 16→32` = back to the rock-solid 16.98 ms / 500/s.
+
+The rest of this file is the (now largely executed) plan that drove the pass; keep it for
+the levers/hazard context, but the levers above supersede the "suggested plan" in §3.
+
+---
+
 ## 0. Orientation (30 seconds)
 
 - Product: a userspace **CoreAudio AudioServerPlugin (HAL plugin)** that turns the NI

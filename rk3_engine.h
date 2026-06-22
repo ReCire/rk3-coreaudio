@@ -64,8 +64,20 @@
  * without first proving the helper can sustain the higher callback rate. Cut the
  * OUT pipeline via N_OUT_XFERS instead (fewer in-flight transfers, SAME 8ms
  * completion rate => no extra helper load; worst case is an underrun, not a storm).
+ *
+ * 2026-06-22 — 64->32 (Gemini #2, the biggest single latency lever): IN completions
+ * 125->250/s. With OUT_FPX still 32 (250/s) that's 500/s total, between the proven-
+ * safe 375/s and the proven-fatal ~1000/s (global FPX=16). De-risked the TRANSPORT
+ * half first in tools/stream.c: --in-fpx 32 / --in-fpx 16 --out-fpx 16 streamed the
+ * DEVICE clean up to 1000/s (0 errs/drops, correct rate, bursty cadence click-free).
+ * So the device is not the limiter — the only residual risk is whether the sandboxed
+ * coreaudiod runloop sustains 500/s (untestable outside coreaudiod). Cuts the IN
+ * pipeline ~4ms AND halves the 384-frame capture-bite WALL (-> lower cap floor).
+ * Revert to 64 (one line) if the install storms. updateFrequency mid-flight is a
+ * NO-OP on this Apple Silicon IOUSBLib shim, so smaller transfers are the ONLY
+ * remaining latency lever (see HANDOFF_LATENCY / the stream.c gate result).
  */
-#define RK3_FRAMES_PER_XFER 64
+#define RK3_FRAMES_PER_XFER 32
 #define RK3_FRAME_BYTES     512   /* isoc maxPacketSize per microframe */
 #define RK3_XFER_BUF        (RK3_FRAMES_PER_XFER * RK3_FRAME_BYTES)
 #define RK3_FRAME_STRIDE    (RK3_FRAMES_PER_XFER / 8)  /* ms-frames per xfer */
@@ -79,12 +91,20 @@
  *
  * 32 (4 ms) halves BOTH the OUT pipeline (N_OUT_XFERS*OUT_STRIDE) and the consumer
  * bite vs 64. Callback-rate safety (this is what stormed coreaudiod before): OUT
- * completions = 8000/OUT_FPX per sec; at 32 that's 250/s OUT + 125/s IN = 375/s
- * total ≈ 1.5x the proven 250/s baseline, far below the ~1000/s (global FPX=16)
- * that stormed the helper + forced a reboot. Do NOT drop OUT_FPX below 16 without
- * first proving the sandboxed helper sustains the higher completion rate.
+ * completions = 8000/OUT_FPX per sec.
+ *
+ * 2026-06-22 — OUT_FPX 32 -> 16 (THE STORM GAMBLE, user-approved). With IN now at
+ * FPX=32 (250/s), OUT=16 is 500/s OUT + 250/s IN = 750/s total. This is the
+ * UNTESTED middle of the storm window: 375/s & 500/s are PROVEN SAFE, ~1000/s
+ * (global FPX=16) is PROVEN FATAL (helper storm -> reboot). 16 is the floor of the
+ * window (the static asserts also forbid below 16 since FPX=32). Cuts the OUT
+ * pipeline N_OUT_XFERS*OUT_STRIDE from 2*4=8 ms to 2*2=4 ms (~4 ms off round-trip,
+ * 16.98 -> ~13 ms target). If the helper storms at 750/s: idle the device + escape
+ * IMMEDIATELY (do NOT killall coreaudiod while wedged), then REVERT to 32. Do NOT
+ * drop OUT_FPX below 16 (static asserts forbid it at FPX=32, and it would push the
+ * rate toward the fatal ceiling).
  */
-#define RK3_OUT_FRAMES_PER_XFER 32
+#define RK3_OUT_FRAMES_PER_XFER 16
 #define RK3_OUT_XFER_BUF        (RK3_OUT_FRAMES_PER_XFER * RK3_FRAME_BYTES)
 #define RK3_OUT_FRAME_STRIDE    (RK3_OUT_FRAMES_PER_XFER / 8)
 _Static_assert(RK3_FRAMES_PER_XFER % RK3_OUT_FRAMES_PER_XFER == 0,
@@ -93,6 +113,32 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
 	"iso_xfer arrays are sized for FPX; OUT_FPX must not exceed it");
 #define RK3_OUT_MIN_LEAD    24
 #define RK3_PAT_RING        256
+
+/*
+ * Low-latency isoch transport (NI's macOS driver uses this; see HANDOFF_LATENCY).
+ * RK3_USE_LOWLAT=1 swaps the basic Read/Write IsochPipeAsync calls for the
+ * LowLatency{Read,Write}IsochPipeAsync family with LowLatencyCreateBuffer'd
+ * kernel-shared buffers. Step 1 is a 1:1 swap (RK3_LL_UPDATE_FREQ=0 => frame
+ * list updated only at transfer completion, i.e. behaviorally identical to the
+ * basic API) — a no-regression checkpoint that establishes the LL path inside
+ * coreaudiod. The latency win comes later by raising RK3_LL_UPDATE_FREQ to 1 and
+ * driving fill/consume from a bounded run-loop timer. Set to 0 to fall back to
+ * the proven basic transport (one-line rebuild) if a regression shows up.
+ *
+ * Proven equivalent to the basic path in tools/stream.c --lowlat (clean tone,
+ * 0 errors, identical OUT byte-rate) before being brought in here.
+ */
+#define RK3_USE_LOWLAT      0   /* TEMP: reverted after a coreaudiod storm on the
+                                 * first LL engine install (2026-06-22). Basic path
+                                 * is the safe known-good. Re-enable once the LL
+                                 * storm is diagnosed (see HANDOFF_LATENCY notes). */
+#define RK3_LL_UPDATE_FREQ  0   /* 0 = update at completion only (1:1 mode) */
+
+#if RK3_USE_LOWLAT
+typedef IOUSBLowLatencyIsocFrame rk3_isoc_frame_t;
+#else
+typedef IOUSBIsocFrame           rk3_isoc_frame_t;
+#endif
 
 /* Audio shape: RK3 is stereo S24_3BE => 6 bytes per stereo frame. */
 #define RK3_BYTES_PER_FRAME 6
@@ -188,8 +234,17 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
  * and pb in_errs/underruns; raise the floor if the trough dips toward 0.
  * Caveat: the drain is a one-time splice (input discontinuity, a single click) ~5.5 s
  * into the stream. Startup-only; revisit if it bothers recording.
+ *
+ * 2026-06-22 — 208 -> 140 after IN dropped to RK3_FRAMES_PER_XFER=32: the IN producer
+ * bite HALVED (384 -> ~192 frames), so the sawtooth is now ±~96 not ±192 and the old
+ * 208 floor (sized for the 384 bite) left ~2-3 ms of cap-ring slack un-reclaimed.
+ * Halved jitter depth means a lower trough floor keeps the same underrun margin. This
+ * is a fill constant (zero callback-rate / storm risk); worst case is a capture click,
+ * not a storm. The drain still fires ~5.5 s in, so measure with `iotest 10 --latency`
+ * (the MIN over impulses = the post-drain steady latency) and watch cap_fill (min) in
+ * the log — raise the floor if the post-drain trough dips toward 0.
  */
-#define RK3_CAP_FILL_FLOOR    208
+#define RK3_CAP_FILL_FLOOR    140
 #define RK3_CAP_SETTLE_FRAMES  (5 * 48000)         /* ~5 s: the IN transient (dev_rate 48200->48013
                                                     * AND the cap balloon) is still building at 2 s;
                                                     * measuring then is garbage. Wait it out fully. */
@@ -207,8 +262,15 @@ struct rk3_engine;
 struct rk3_iso_xfer {
 	struct rk3_engine *e;
 	int index;
+#if RK3_USE_LOWLAT
+	/* kernel-shared, from LowLatencyCreateBuffer; sized per direction (IN uses
+	 * RK3_XFER_BUF / RK3_FRAMES_PER_XFER, OUT the smaller OUT_ values). */
+	uint8_t *buf;
+	rk3_isoc_frame_t *frames;
+#else
 	uint8_t buf[RK3_XFER_BUF];
-	IOUSBIsocFrame frames[RK3_FRAMES_PER_XFER];
+	rk3_isoc_frame_t frames[RK3_FRAMES_PER_XFER];
+#endif
 	UInt64 frame_start;
 };
 

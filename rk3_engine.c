@@ -103,6 +103,108 @@ static void resubmit_in(struct rk3_iso_xfer *x);
 static int  submit_out(struct rk3_iso_xfer *x);
 static void fill_out(struct rk3_engine *e, struct rk3_iso_xfer *x);
 static void out_done(void *refcon, IOReturn result, void *arg0);
+static void in_done(void *refcon, IOReturn result, void *arg0);
+
+/*
+ * Isoc submit wrappers — the ONLY place the basic vs low-latency API divergence
+ * lives. The callback bodies (in_done/fill_out/out_done/...) access x->buf and
+ * x->frames[f] identically either way; only the submit call name + the extra
+ * updateFrequency arg (and the kernel-shared buffer allocation) differ. See
+ * RK3_USE_LOWLAT in rk3_engine.h.
+ */
+static IOReturn rk3_read_isoc(struct rk3_engine *e, struct rk3_iso_xfer *x,
+			      UInt32 nframes)
+{
+#if RK3_USE_LOWLAT
+	return (*e->usb.intf)->LowLatencyReadIsochPipeAsync(e->usb.intf,
+			e->usb.pipe_iso_in, x->buf, x->frame_start, nframes,
+			RK3_LL_UPDATE_FREQ, x->frames, in_done, x);
+#else
+	return (*e->usb.intf)->ReadIsochPipeAsync(e->usb.intf,
+			e->usb.pipe_iso_in, x->buf, x->frame_start, nframes,
+			x->frames, in_done, x);
+#endif
+}
+
+static IOReturn rk3_write_isoc(struct rk3_engine *e, struct rk3_iso_xfer *x,
+			       UInt32 nframes)
+{
+#if RK3_USE_LOWLAT
+	return (*e->usb.intf)->LowLatencyWriteIsochPipeAsync(e->usb.intf,
+			e->usb.pipe_iso_out, x->buf, x->frame_start, nframes,
+			RK3_LL_UPDATE_FREQ, x->frames, out_done, x);
+#else
+	return (*e->usb.intf)->WriteIsochPipeAsync(e->usb.intf,
+			e->usb.pipe_iso_out, x->buf, x->frame_start, nframes,
+			x->frames, out_done, x);
+#endif
+}
+
+#if RK3_USE_LOWLAT
+/*
+ * Allocate one transfer's kernel-shared data + frame-list buffers. read=1 for
+ * the capture pipe, 0 for playback. bufsz/nframes are direction-specific (IN is
+ * full size, OUT the smaller OUT_ values). Returns 0 on success. The basic path
+ * uses inline arrays and needs no allocation, so these are LL-only.
+ */
+static int ll_alloc_xfer(struct rk3_engine *e, struct rk3_iso_xfer *x,
+			 size_t bufsz, int nframes, int read)
+{
+	IOReturn kr = (*e->usb.intf)->LowLatencyCreateBuffer(e->usb.intf,
+			(void **)&x->buf, bufsz,
+			read ? kUSBLowLatencyReadBuffer : kUSBLowLatencyWriteBuffer);
+	if (kr != kIOReturnSuccess || !x->buf) {
+		ELOG("LowLatencyCreateBuffer(data) 0x%08x", kr);
+		x->buf = NULL;
+		return -1;
+	}
+	kr = (*e->usb.intf)->LowLatencyCreateBuffer(e->usb.intf,
+			(void **)&x->frames,
+			(IOByteCount)(nframes * sizeof(rk3_isoc_frame_t)),
+			kUSBLowLatencyFrameListBuffer);
+	if (kr != kIOReturnSuccess || !x->frames) {
+		ELOG("LowLatencyCreateBuffer(framelist) 0x%08x", kr);
+		x->frames = NULL;
+		return -1;
+	}
+	memset(x->buf, 0, bufsz);
+	return 0;
+}
+
+static void ll_free_xfer(struct rk3_engine *e, struct rk3_iso_xfer *x)
+{
+	if (x->buf) {
+		(*e->usb.intf)->LowLatencyDestroyBuffer(e->usb.intf, x->buf);
+		x->buf = NULL;
+	}
+	if (x->frames) {
+		(*e->usb.intf)->LowLatencyDestroyBuffer(e->usb.intf, x->frames);
+		x->frames = NULL;
+	}
+}
+
+/* Allocate all isoc buffers for a stream start; frees partial on failure. */
+static int ll_alloc_all(struct rk3_engine *e)
+{
+	for (int i = 0; i < RK3_N_XFERS; i++)
+		if (ll_alloc_xfer(e, &e->in[i], RK3_XFER_BUF,
+				  RK3_FRAMES_PER_XFER, 1) != 0)
+			return -1;
+	for (int i = 0; i < RK3_N_OUT_XFERS; i++)
+		if (ll_alloc_xfer(e, &e->out[i], RK3_OUT_XFER_BUF,
+				  RK3_OUT_FRAMES_PER_XFER, 0) != 0)
+			return -1;
+	return 0;
+}
+
+static void ll_free_all(struct rk3_engine *e)
+{
+	for (int i = 0; i < RK3_N_XFERS; i++)
+		ll_free_xfer(e, &e->in[i]);
+	for (int i = 0; i < RK3_N_OUT_XFERS; i++)
+		ll_free_xfer(e, &e->out[i]);
+}
+#endif /* RK3_USE_LOWLAT */
 
 #define SCHED_MARGIN 4
 static UInt64 schedule_frame(struct rk3_engine *e, UInt64 want)
@@ -229,9 +331,7 @@ static int submit_out(struct rk3_iso_xfer *x)
 {
 	struct rk3_engine *e = x->e;
 	for (int tries = 0; tries < 8; tries++) {
-		IOReturn kr = (*e->usb.intf)->WriteIsochPipeAsync(e->usb.intf,
-				e->usb.pipe_iso_out, x->buf, x->frame_start,
-				RK3_OUT_FRAMES_PER_XFER, x->frames, out_done, x);
+		IOReturn kr = rk3_write_isoc(e, x, RK3_OUT_FRAMES_PER_XFER);
 		if (kr == kIOReturnSuccess)
 			return 0;
 		e->out_errs++;
@@ -304,23 +404,28 @@ static void resubmit_in(struct rk3_iso_xfer *x)
 		x->frames[f].frActCount = 0;
 		x->frames[f].frStatus = 0;
 	}
-	IOReturn kr = (*e->usb.intf)->ReadIsochPipeAsync(e->usb.intf,
-			e->usb.pipe_iso_in, x->buf, x->frame_start,
-			RK3_FRAMES_PER_XFER, x->frames, in_done, x);
+	IOReturn kr = rk3_read_isoc(e, x, RK3_FRAMES_PER_XFER);
 	if (kr != kIOReturnSuccess &&
 	    atomic_load_explicit(&e->audio_running, memory_order_acquire)) {
 		e->in_errs++;
 		x->frame_start = schedule_frame(e, 0);
-		(*e->usb.intf)->ReadIsochPipeAsync(e->usb.intf,
-			e->usb.pipe_iso_in, x->buf, x->frame_start,
-			RK3_FRAMES_PER_XFER, x->frames, in_done, x);
+		rk3_read_isoc(e, x, RK3_FRAMES_PER_XFER);
 	}
 }
 
 /* ---- engine thread --------------------------------------------------- */
 
-static void prime_chains(struct rk3_engine *e)
+static int prime_chains(struct rk3_engine *e)
 {
+#if RK3_USE_LOWLAT
+	/* Allocate this start's kernel-shared isoc buffers (freed in audio_stop). */
+	if (ll_alloc_all(e) != 0) {
+		ELOG("prime: LowLatency buffer allocation failed");
+		ll_free_all(e);
+		return -1;
+	}
+#endif
+
 	UInt64 frame = 0;
 	AbsoluteTime atTime;
 	(*e->usb.intf)->GetBusFrameNumber(e->usb.intf, &frame, &atTime);
@@ -332,10 +437,7 @@ static void prime_chains(struct rk3_engine *e)
 		e->in[i].frame_start = start + (UInt64)i * RK3_FRAME_STRIDE;
 		for (int f = 0; f < RK3_FRAMES_PER_XFER; f++)
 			e->in[i].frames[f].frReqCount = RK3_FRAME_BYTES;
-		IOReturn kr = (*e->usb.intf)->ReadIsochPipeAsync(e->usb.intf,
-				e->usb.pipe_iso_in, e->in[i].buf,
-				e->in[i].frame_start, RK3_FRAMES_PER_XFER,
-				e->in[i].frames, in_done, &e->in[i]);
+		IOReturn kr = rk3_read_isoc(e, &e->in[i], RK3_FRAMES_PER_XFER);
 		if (kr != kIOReturnSuccess)
 			ELOG("prime IN %d: 0x%08x", i, kr);
 	}
@@ -348,6 +450,7 @@ static void prime_chains(struct rk3_engine *e)
 		if (submit_out(&e->out[i]) != 0)
 			ELOG("prime OUT %d failed", i);
 	}
+	return 0;
 }
 
 /*
@@ -979,7 +1082,8 @@ int rk3_engine_audio_start(struct rk3_engine *e)
 		}
 		if (params_rc == 0) {
 			caiaq_codec_reset(&e->codec);
-			prime_chains(e);
+			if (prime_chains(e) != 0)
+				params_rc = -1;   /* propagate to the failure check below */
 		}
 
 		/* Re-arm MIDI so the controls keep working alongside audio (or, on a
@@ -1010,6 +1114,11 @@ void rk3_engine_audio_stop(struct rk3_engine *e)
 	engine_sync(e, 1000, ^{
 		(*e->usb.intf)->AbortPipe(e->usb.intf, e->usb.pipe_iso_in);
 		(*e->usb.intf)->AbortPipe(e->usb.intf, e->usb.pipe_iso_out);
+#if RK3_USE_LOWLAT
+		/* free the kernel-shared buffers now the chains are aborted (on the
+		 * engine thread, so no completion can still touch them). */
+		ll_free_all(e);
+#endif
 	});
 	ELOG("audio_stop: isoc chains aborted (USB + MIDI stay up)");
 }

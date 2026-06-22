@@ -49,6 +49,15 @@ struct iso_xfer {
 	uint8_t buf[XFER_BUF];
 	IOUSBIsocFrame frames[FRAMES_PER_XFER];
 	UInt64 frame_start;
+
+	/*
+	 * Low-latency path (--lowlat): the data buffer and frame list must come
+	 * from LowLatencyCreateBuffer (kernel-shared memory), not inline arrays,
+	 * so the kernel can write frame status/timestamps as microframes complete.
+	 * Used instead of buf[]/frames[] when stream.lowlat is set.
+	 */
+	uint8_t *llbuf;                          /* LowLatency{Read,Write}Buffer */
+	IOUSBLowLatencyIsocFrame *llframes;      /* LowLatencyFrameListBuffer */
 };
 
 struct stream {
@@ -57,6 +66,9 @@ struct stream {
 	int bpp;
 	int rate;
 	int do_play;
+	int lowlat;      /* use the low-latency isoch API (LowLatency* calls) */
+	int in_fpx;      /* microframes per IN  (capture)  transfer (<= FRAMES_PER_XFER) */
+	int out_fpx;     /* microframes per OUT (playback) transfer (<= FRAMES_PER_XFER) */
 	int silence;     /* play digital zero instead of the tone */
 	int pb_chk0;     /* experiment: playback check byte at i%4==0 (capture-style) */
 	int const_cad;   /* experiment: steady N-frames-per-microframe OUT cadence */
@@ -97,6 +109,22 @@ struct stream {
 	int len_hist[FRAME_BYTES + 1];   /* histogram of OUT frame byte-counts */
 	int busy_now, busy_max;
 	int dbg, out_dbg;  /* callbacks left to log verbosely */
+
+	/*
+	 * Low-latency updateFrequency experiment (--update-freq N, 0..8). With N>0
+	 * the kernel writes frActCount into the shared frame list every N ms while a
+	 * transfer is still in flight, instead of only at completion. A 1ms poll
+	 * timer (poll_cb) witnesses this: it counts polls that catch an IN transfer
+	 * STRICTLY partway filled (0 < filled < FRAMES_PER_XFER). With N==0 this is
+	 * ~never (status appears all-at-once at completion); with N>0 it is frequent.
+	 * This proves microframe visibility WITHOUT raising the resubmission rate
+	 * (re-arm still happens only in the completion callback) — the storm-safe
+	 * mechanism behind the §3-A latency win.
+	 */
+	int  update_freq;        /* IOKit updateFrequency arg (0 = at-completion) */
+	long poll_count;         /* poll_cb invocations while running */
+	long poll_partial;       /* polls that caught a strictly-partial IN xfer */
+	int  poll_partial_max;   /* most frames seen filled in a partial snapshot */
 };
 
 static int pat_count(struct stream *s) { return s->pat_head - s->pat_tail; }
@@ -106,8 +134,19 @@ static void pat_push(struct stream *s, struct iso_xfer *x)
 	if (pat_count(s) >= PAT_RING)
 		s->pat_tail++;                       /* drop oldest on overflow */
 	int *slot = s->pat[s->pat_head % PAT_RING];
-	for (int f = 0; f < FRAMES_PER_XFER; f++)
+	for (int f = 0; f < s->in_fpx; f++)
 		slot[f] = x->frames[f].frActCount;
+	s->pat_head++;
+}
+
+/* Push an already-extracted per-microframe cadence (low-latency in_done path). */
+static void pat_push_acts(struct stream *s, const int *acts)
+{
+	if (pat_count(s) >= PAT_RING)
+		s->pat_tail++;
+	int *slot = s->pat[s->pat_head % PAT_RING];
+	for (int f = 0; f < s->in_fpx; f++)
+		slot[f] = acts[f];
 	s->pat_head++;
 }
 
@@ -124,7 +163,7 @@ static void pat_synth(struct stream *s, int *lens)
 	int pkt_frames = s->bpp / 8;          /* stereo frames per non-zero packet */
 	int need = s->rate / 8000;            /* avg frames per microframe */
 	int rem  = s->rate % 8000;
-	for (int f = 0; f < FRAMES_PER_XFER; f++) {
+	for (int f = 0; f < s->out_fpx; f++) {
 		s->out_acc += need * 8000 + rem;  /* frames*8000, fixed-point */
 		if (s->out_acc >= pkt_frames * 8000) {
 			s->out_acc -= pkt_frames * 8000;
@@ -146,7 +185,7 @@ static void pat_const(struct stream *s, int *lens)
 {
 	int base = s->rate / 8000;
 	int rem  = s->rate % 8000;
-	for (int f = 0; f < FRAMES_PER_XFER; f++) {
+	for (int f = 0; f < s->out_fpx; f++) {
 		int nf = base;
 		s->out_acc += rem;
 		if (s->out_acc >= 8000) { s->out_acc -= 8000; nf++; }
@@ -159,7 +198,7 @@ static void pat_pop(struct stream *s, int *lens)
 {
 	if (pat_count(s) > 0) {
 		int *slot = s->pat[s->pat_tail % PAT_RING];
-		for (int f = 0; f < FRAMES_PER_XFER; f++)
+		for (int f = 0; f < s->out_fpx; f++)
 			lens[f] = slot[f];
 		s->pat_tail++;
 	} else {
@@ -227,6 +266,13 @@ static int submit_out(struct iso_xfer *x);
 static void fill_out(struct stream *s, struct iso_xfer *x);
 static void out_done(void *refcon, IOReturn result, void *arg0);
 
+/* low-latency (--lowlat) variants — defined after the basic ones */
+static void ll_resubmit_in(struct iso_xfer *x);
+static int  ll_submit_out(struct iso_xfer *x);
+static void ll_fill_out(struct stream *s, struct iso_xfer *x);
+static void ll_out_done(void *refcon, IOReturn result, void *arg0);
+static void ll_in_done(void *refcon, IOReturn result, void *arg0);
+
 /*
  * Self-healing schedule: keep transfers a few ms-frames ahead of the bus.
  * If a callback fell behind and `want` is already in the past, re-anchor to
@@ -257,14 +303,14 @@ static void in_done(void *refcon, IOReturn result, void *arg0)
 
 	if (s->dbg > 0) {
 		printf("[in #%d] result=0x%08x frames:", x->index, result);
-		for (int f = 0; f < FRAMES_PER_XFER; f++)
+		for (int f = 0; f < s->in_fpx; f++)
 			printf(" %u/%u", x->frames[f].frActCount,
 			       x->frames[f].frReqCount);
 		printf("\n");
 	}
 
 	uint8_t scratch[XFER_BUF];
-	for (int f = 0; f < FRAMES_PER_XFER; f++) {
+	for (int f = 0; f < s->in_fpx; f++) {
 		int act = x->frames[f].frActCount;
 		if (act <= 0)
 			continue;
@@ -304,12 +350,12 @@ static void fill_out(struct stream *s, struct iso_xfer *x)
 	 * cadence often ends in zeros, so move the last non-zero packet to the final
 	 * slot (preserves the total byte count; interior/leading zeros are fine).
 	 */
-	if (lens[FRAMES_PER_XFER - 1] == 0) {
-		int j = FRAMES_PER_XFER - 2;
+	if (lens[s->out_fpx - 1] == 0) {
+		int j = s->out_fpx - 2;
 		while (j >= 0 && lens[j] == 0)
 			j--;
 		if (j >= 0) {
-			lens[FRAMES_PER_XFER - 1] = lens[j];
+			lens[s->out_fpx - 1] = lens[j];
 			lens[j] = 0;
 		}
 	}
@@ -319,7 +365,7 @@ static void fill_out(struct stream *s, struct iso_xfer *x)
 	 * f*FRAME_BYTES only because every capture frReqCount == FRAME_BYTES.)
 	 */
 	int off = 0;
-	for (int f = 0; f < FRAMES_PER_XFER; f++) {
+	for (int f = 0; f < s->out_fpx; f++) {
 		int len = lens[f];
 		if (len > FRAME_BYTES) len = FRAME_BYTES;
 		s->len_hist[len]++;
@@ -347,7 +393,7 @@ static int submit_out(struct iso_xfer *x)
 	for (int tries = 0; tries < 8; tries++) {
 		IOReturn kr = (*s->usb->intf)->WriteIsochPipeAsync(s->usb->intf,
 				s->usb->pipe_iso_out, x->buf, x->frame_start,
-				FRAMES_PER_XFER, x->frames, out_done, x);
+				s->out_fpx, x->frames, out_done, x);
 		if (kr == kIOReturnSuccess)
 			return 0;
 		s->out_errs++;
@@ -356,7 +402,7 @@ static int submit_out(struct iso_xfer *x)
 		(*s->usb->intf)->GetBusFrameNumber(s->usb->intf, &cur, &at);
 		UInt64 floor = cur + OUT_MIN_LEAD;
 		x->frame_start = (x->frame_start < floor)
-				 ? floor : x->frame_start + FRAME_STRIDE;
+				 ? floor : x->frame_start + s->out_fpx / 8;
 	}
 	s->out_drops++;   /* gave up: this slot leaves the chain */
 	return -1;
@@ -380,7 +426,7 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 		printf("[out #%d] result=0x%08x frame=%llu\n",
 		       x->index, result, x->frame_start);
 	}
-	x->frame_start += (UInt64)N_OUT_XFERS * FRAME_STRIDE;
+	x->frame_start += (UInt64)N_OUT_XFERS * (s->out_fpx / 8);
 	fill_out(s, x);
 	submit_out(x);
 }
@@ -388,23 +434,208 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 static void resubmit_in(struct iso_xfer *x)
 {
 	struct stream *s = x->s;
-	x->frame_start = schedule_frame(s, x->frame_start + N_XFERS * FRAME_STRIDE);
-	for (int f = 0; f < FRAMES_PER_XFER; f++) {
+	x->frame_start = schedule_frame(s, x->frame_start + N_XFERS * (s->in_fpx / 8));
+	for (int f = 0; f < s->in_fpx; f++) {
 		x->frames[f].frReqCount = FRAME_BYTES;
 		x->frames[f].frActCount = 0;
 		x->frames[f].frStatus = 0;
 	}
 	IOReturn kr = (*s->usb->intf)->ReadIsochPipeAsync(s->usb->intf,
 			s->usb->pipe_iso_in, x->buf, x->frame_start,
-			FRAMES_PER_XFER, x->frames, in_done, x);
+			s->in_fpx, x->frames, in_done, x);
 	if (kr != kIOReturnSuccess && s->running) {
 		s->in_errs++;
 		/* re-anchor hard and retry once */
 		x->frame_start = schedule_frame(s, 0);
 		(*s->usb->intf)->ReadIsochPipeAsync(s->usb->intf,
 			s->usb->pipe_iso_in, x->buf, x->frame_start,
-			FRAMES_PER_XFER, x->frames, in_done, x);
+			s->in_fpx, x->frames, in_done, x);
 	}
+}
+
+/* ---- low-latency (--lowlat) isoc path -------------------------------- *
+ *
+ * Step 1 of the low-latency port: a 1:1 swap of the basic Read/Write
+ * IsochPipeAsync calls for LowLatency{Read,Write}IsochPipeAsync. Same transfer
+ * sizes, same per-completion re-arm, updateFrequency = 0 (the kernel writes
+ * frame status only at transfer completion, i.e. identical visibility to the
+ * basic API). The ONLY differences from the basic path are: (a) buffers come
+ * from LowLatencyCreateBuffer (kernel-shared) instead of inline arrays, and
+ * (b) the frame list is IOUSBLowLatencyIsocFrame. Goal: prove the low-latency
+ * API streams a clean tone with 0 errors on this device before step 2 adds the
+ * timer-driven poll + smaller transfers that actually cut latency.
+ *
+ * Step 2 lives behind --update-freq N (default 0). N is the IOKit
+ * updateFrequency: 0 = status written only at completion (1:1, proven clean);
+ * 1..8 = kernel writes microframe status into the shared frame list every N ms
+ * while in flight. The poll timer (poll_cb) measures the resulting early
+ * visibility; the re-arm rate is UNCHANGED, so this stays storm-safe.
+ */
+#define LL_UPDATE_FREQ 0   /* default for s.update_freq; overridden by --update-freq */
+
+static void ll_fill_out(struct stream *s, struct iso_xfer *x)
+{
+	int lens[FRAMES_PER_XFER];
+	if (s->const_cad)
+		pat_const(s, lens);
+	else
+		pat_pop(s, lens);
+	if (lens[s->out_fpx - 1] == 0) {               /* no trailing 0-length frame */
+		int j = s->out_fpx - 2;
+		while (j >= 0 && lens[j] == 0)
+			j--;
+		if (j >= 0) {
+			lens[s->out_fpx - 1] = lens[j];
+			lens[j] = 0;
+		}
+	}
+	int off = 0;                                   /* contiguous frReqCount packing */
+	for (int f = 0; f < s->out_fpx; f++) {
+		int len = lens[f];
+		if (len > FRAME_BYTES) len = FRAME_BYTES;
+		s->len_hist[len]++;
+		x->llframes[f].frReqCount = len;
+		x->llframes[f].frActCount = 0;
+		x->llframes[f].frStatus = 0;
+		if (len > 0)
+			caiaq_playback_mode2(&s->codec, x->llbuf + off, len,
+					     s->tone, &s->tone_pos, (int)s->tone_size);
+		off += len;
+	}
+}
+
+static int ll_submit_out(struct iso_xfer *x)
+{
+	struct stream *s = x->s;
+	for (int tries = 0; tries < 8; tries++) {
+		IOReturn kr = (*s->usb->intf)->LowLatencyWriteIsochPipeAsync(
+				s->usb->intf, s->usb->pipe_iso_out, x->llbuf,
+				x->frame_start, s->out_fpx, s->update_freq,
+				x->llframes, ll_out_done, x);
+		if (kr == kIOReturnSuccess)
+			return 0;
+		s->out_errs++;
+		UInt64 cur = 0;
+		AbsoluteTime at;
+		(*s->usb->intf)->GetBusFrameNumber(s->usb->intf, &cur, &at);
+		UInt64 floor = cur + OUT_MIN_LEAD;
+		x->frame_start = (x->frame_start < floor)
+				 ? floor : x->frame_start + s->out_fpx / 8;
+	}
+	s->out_drops++;
+	return -1;
+}
+
+static void ll_out_done(void *refcon, IOReturn result, void *arg0)
+{
+	struct iso_xfer *x = refcon;
+	struct stream *s = x->s;
+	(void)arg0;
+	s->out_done_count++;
+	if (!s->running)
+		return;
+	if (s->out_dbg > 0) {
+		s->out_dbg--;
+		printf("[ll out #%d] result=0x%08x frame=%llu\n",
+		       x->index, result, x->frame_start);
+	}
+	x->frame_start += (UInt64)N_OUT_XFERS * (s->out_fpx / 8);
+	ll_fill_out(s, x);
+	ll_submit_out(x);
+}
+
+static void ll_in_done(void *refcon, IOReturn result, void *arg0)
+{
+	struct iso_xfer *x = refcon;
+	struct stream *s = x->s;
+	(void)arg0;
+
+	if (!s->running)
+		return;
+	s->in_count++;
+
+	if (s->dbg > 0) {
+		printf("[ll in #%d] result=0x%08x frames:", x->index, result);
+		for (int f = 0; f < s->in_fpx; f++)
+			printf(" %u/%u", x->llframes[f].frActCount,
+			       x->llframes[f].frReqCount);
+		printf("\n");
+	}
+
+	uint8_t scratch[XFER_BUF];
+	int acts[FRAMES_PER_XFER];
+	for (int f = 0; f < s->in_fpx; f++) {
+		int act = x->llframes[f].frActCount;
+		acts[f] = act;
+		if (act <= 0)
+			continue;
+		int pos = 0;
+		caiaq_capture_mode2(&s->codec, x->llbuf + f * FRAME_BYTES, act,
+				    scratch, &pos, sizeof(scratch));
+		if (pos > 0)
+			cap_append(s, scratch, pos);
+	}
+
+	if (s->do_play)
+		pat_push_acts(s, acts);
+
+	if (s->dbg > 0)
+		s->dbg--;
+
+	ll_resubmit_in(x);
+}
+
+static void ll_resubmit_in(struct iso_xfer *x)
+{
+	struct stream *s = x->s;
+	x->frame_start = schedule_frame(s, x->frame_start + N_XFERS * (s->in_fpx / 8));
+	for (int f = 0; f < s->in_fpx; f++) {
+		x->llframes[f].frReqCount = FRAME_BYTES;
+		x->llframes[f].frActCount = 0;
+		x->llframes[f].frStatus = 0;
+	}
+	IOReturn kr = (*s->usb->intf)->LowLatencyReadIsochPipeAsync(s->usb->intf,
+			s->usb->pipe_iso_in, x->llbuf, x->frame_start,
+			s->in_fpx, s->update_freq, x->llframes, ll_in_done, x);
+	if (kr != kIOReturnSuccess && s->running) {
+		s->in_errs++;
+		x->frame_start = schedule_frame(s, 0);
+		(*s->usb->intf)->LowLatencyReadIsochPipeAsync(s->usb->intf,
+			s->usb->pipe_iso_in, x->llbuf, x->frame_start,
+			s->in_fpx, s->update_freq, x->llframes, ll_in_done, x);
+	}
+}
+
+/*
+ * Allocate kernel-shared buffers for one transfer (data + frame list) via
+ * LowLatencyCreateBuffer. read=1 for capture (kUSBLowLatencyReadBuffer),
+ * read=0 for playback (kUSBLowLatencyWriteBuffer). Returns 0 on success.
+ */
+static int ll_alloc_xfer(struct stream *s, struct iso_xfer *x, int read)
+{
+	IOReturn kr = (*s->usb->intf)->LowLatencyCreateBuffer(s->usb->intf,
+			(void **)&x->llbuf, XFER_BUF,
+			read ? kUSBLowLatencyReadBuffer : kUSBLowLatencyWriteBuffer);
+	if (kr != kIOReturnSuccess || !x->llbuf) {
+		fprintf(stderr, "LowLatencyCreateBuffer(data) 0x%08x\n", kr);
+		return -1;
+	}
+	kr = (*s->usb->intf)->LowLatencyCreateBuffer(s->usb->intf,
+			(void **)&x->llframes,
+			(IOByteCount)(FRAMES_PER_XFER * sizeof(IOUSBLowLatencyIsocFrame)),
+			kUSBLowLatencyFrameListBuffer);
+	if (kr != kIOReturnSuccess || !x->llframes) {
+		fprintf(stderr, "LowLatencyCreateBuffer(framelist) 0x%08x\n", kr);
+		return -1;
+	}
+	memset(x->llbuf, 0, XFER_BUF);
+	return 0;
+}
+
+static void ll_free_xfer(struct stream *s, struct iso_xfer *x)
+{
+	if (x->llbuf)    { (*s->usb->intf)->LowLatencyDestroyBuffer(s->usb->intf, x->llbuf);    x->llbuf = NULL; }
+	if (x->llframes) { (*s->usb->intf)->LowLatencyDestroyBuffer(s->usb->intf, x->llframes); x->llframes = NULL; }
 }
 
 /* ---- tone generation ------------------------------------------------ */
@@ -445,6 +676,37 @@ static void stop_cb(CFRunLoopTimerRef t, void *info)
 	CFRunLoopStop(CFRunLoopGetCurrent());
 }
 
+/*
+ * 1ms poll on the run-loop thread. Scans in-flight IN transfers' shared frame
+ * lists for a STRICTLY-partial snapshot (0 < frames-filled < FRAMES_PER_XFER).
+ * Such a snapshot can only occur if the kernel wrote frActCount mid-transfer,
+ * i.e. updateFrequency>0. It does NOT touch the pipes or re-arm anything, so it
+ * cannot raise the resubmission rate — this only observes. Safe in basic mode
+ * too: llframes is NULL there, so filled stays 0 and the poll is a no-op.
+ */
+static void poll_cb(CFRunLoopTimerRef t, void *info)
+{
+	struct stream *s = info;
+	(void)t;
+	if (!s->running)
+		return;
+	s->poll_count++;
+	for (int i = 0; i < N_XFERS; i++) {
+		if (!s->in[i].llframes)
+			continue;
+		int filled = 0;
+		for (int f = 0; f < s->in_fpx; f++)
+			if (s->in[i].llframes[f].frActCount > 0)
+				filled++;
+		if (filled > 0 && filled < s->in_fpx) {
+			s->poll_partial++;
+			if (filled > s->poll_partial_max)
+				s->poll_partial_max = filled;
+			break;                       /* one witness per poll is enough */
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	struct rk3_usb u;
@@ -458,16 +720,51 @@ int main(int argc, char **argv)
 	s.off = 4;          /* Linux out_pos = BYTES_PER_SAMPLE + 1; OUT stream phase */
 	s.dbg = 0;
 	s.out_dbg = 0;
+	s.update_freq = LL_UPDATE_FREQ;
+	s.in_fpx = FRAMES_PER_XFER;
+	s.out_fpx = FRAMES_PER_XFER;
 
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--play")) s.do_play = 1;
+		else if (!strcmp(argv[i], "--lowlat")) s.lowlat = 1;
+		else if (!strcmp(argv[i], "--update-freq") && i + 1 < argc) {
+			s.lowlat = 1;                 /* update-freq implies low-latency */
+			s.update_freq = atoi(argv[++i]);
+			if (s.update_freq < 0) s.update_freq = 0;
+			if (s.update_freq > 8) s.update_freq = 8;
+		}
 		else if (!strcmp(argv[i], "--chk0")) s.pb_chk0 = 1;
 		else if (!strcmp(argv[i], "--const")) s.const_cad = 1;
 		else if (!strcmp(argv[i], "--off") && i + 1 < argc) s.off = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--silence")) { s.do_play = 1; s.silence = 1; }
 		else if (!strcmp(argv[i], "--freq") && i + 1 < argc) s.freq = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--rate") && i + 1 < argc) s.rate = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--in-fpx") && i + 1 < argc) s.in_fpx = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--out-fpx") && i + 1 < argc) s.out_fpx = atoi(argv[++i]);
 		else seconds = atof(argv[i]);
+	}
+
+	/*
+	 * Transfer-size knobs (latency experiment): smaller IN/OUT transfers surface
+	 * capture / drain playback sooner but raise the completion-callback rate
+	 * (8000/fpx per direction). Must be a multiple of 8 (one ms-frame) in [8,64]
+	 * so the ms-frame stride fpx/8 is a positive integer and fits the buffers.
+	 */
+	if (s.in_fpx < 8 || s.in_fpx > FRAMES_PER_XFER || s.in_fpx % 8 ||
+	    s.out_fpx < 8 || s.out_fpx > FRAMES_PER_XFER || s.out_fpx % 8) {
+		fprintf(stderr, "--in-fpx/--out-fpx must be a multiple of 8 in [8,%d]\n",
+			FRAMES_PER_XFER);
+		return 2;
+	}
+	/*
+	 * The bursty IN->OUT cadence mirror (pat_push/pat_pop) is 1:1 per microframe,
+	 * so it only lines up when in_fpx == out_fpx. With split sizes fall back to
+	 * the steady --const cadence (decoupled from capture) so OUT stays correct.
+	 */
+	if (s.do_play && !s.const_cad && s.in_fpx != s.out_fpx) {
+		s.const_cad = 1;
+		printf("note: in_fpx(%d) != out_fpx(%d) -> using --const OUT cadence "
+		       "(mirror needs equal sizes)\n", s.in_fpx, s.out_fpx);
 	}
 
 	if (rk3_usb_open(&u) != 0)
@@ -479,9 +776,18 @@ int main(int argc, char **argv)
 	if (n_streams < 1) n_streams = 1;
 	s.bpp = caiaq_compute_bpp(s.rate, spec.data_alignment, n_streams);
 
-	printf("rate=%d bpp=%d data_alignment=%u  capture%s for %.1fs\n",
+	printf("rate=%d bpp=%d data_alignment=%u  capture%s%s for %.1fs\n",
 	       s.rate, s.bpp, spec.data_alignment,
-	       s.do_play ? "+playback" : "", seconds);
+	       s.do_play ? "+playback" : "",
+	       s.lowlat ? (s.update_freq ? " [low-latency, update-freq=N]"
+	                                 : " [low-latency, 1:1]") : "",
+	       seconds);
+	printf("  in_fpx=%d (%d IN compl/s) out_fpx=%d (%d OUT compl/s)\n",
+	       s.in_fpx, 8000 / s.in_fpx, s.out_fpx, 8000 / s.out_fpx);
+	if (s.lowlat)
+		printf("  updateFrequency=%d (%s)\n", s.update_freq,
+		       s.update_freq ? "kernel writes microframe status in flight"
+		                     : "status at completion only");
 
 	if (caiaq_set_audio_params(&u, s.rate, 24, s.bpp) != 0) {
 		rk3_usb_close(&u);
@@ -516,12 +822,22 @@ int main(int argc, char **argv)
 	for (int i = 0; i < N_XFERS; i++) {
 		s.in[i].s = &s;
 		s.in[i].index = i;
-		s.in[i].frame_start = start + (UInt64)i * FRAME_STRIDE;
-		for (int f = 0; f < FRAMES_PER_XFER; f++)
-			s.in[i].frames[f].frReqCount = FRAME_BYTES;
-		kr = (*u.intf)->ReadIsochPipeAsync(u.intf, u.pipe_iso_in,
-				s.in[i].buf, s.in[i].frame_start,
-				FRAMES_PER_XFER, s.in[i].frames, in_done, &s.in[i]);
+		s.in[i].frame_start = start + (UInt64)i * (s.in_fpx / 8);
+		if (s.lowlat) {
+			if (ll_alloc_xfer(&s, &s.in[i], 1) != 0) { rk3_usb_close(&u); return 1; }
+			for (int f = 0; f < s.in_fpx; f++)
+				s.in[i].llframes[f].frReqCount = FRAME_BYTES;
+			kr = (*u.intf)->LowLatencyReadIsochPipeAsync(u.intf,
+					u.pipe_iso_in, s.in[i].llbuf, s.in[i].frame_start,
+					s.in_fpx, s.update_freq, s.in[i].llframes,
+					ll_in_done, &s.in[i]);
+		} else {
+			for (int f = 0; f < s.in_fpx; f++)
+				s.in[i].frames[f].frReqCount = FRAME_BYTES;
+			kr = (*u.intf)->ReadIsochPipeAsync(u.intf, u.pipe_iso_in,
+					s.in[i].buf, s.in[i].frame_start,
+					s.in_fpx, s.in[i].frames, in_done, &s.in[i]);
+		}
 		if (kr != kIOReturnSuccess)
 			fprintf(stderr, "ReadIsochPipeAsync(prime %d) 0x%08x\n", i, kr);
 	}
@@ -534,10 +850,17 @@ int main(int argc, char **argv)
 		for (int i = 0; i < N_OUT_XFERS; i++) {
 			s.out[i].s = &s;
 			s.out[i].index = i;
-			s.out[i].frame_start = out_start + (UInt64)i * FRAME_STRIDE;
-			fill_out(&s, &s.out[i]);
-			if (submit_out(&s.out[i]) != 0)
-				fprintf(stderr, "submit_out(prime %d) failed\n", i);
+			s.out[i].frame_start = out_start + (UInt64)i * (s.out_fpx / 8);
+			if (s.lowlat) {
+				if (ll_alloc_xfer(&s, &s.out[i], 0) != 0) { rk3_usb_close(&u); return 1; }
+				ll_fill_out(&s, &s.out[i]);
+				if (ll_submit_out(&s.out[i]) != 0)
+					fprintf(stderr, "submit_out(prime %d) failed\n", i);
+			} else {
+				fill_out(&s, &s.out[i]);
+				if (submit_out(&s.out[i]) != 0)
+					fprintf(stderr, "submit_out(prime %d) failed\n", i);
+			}
 		}
 	}
 
@@ -548,6 +871,13 @@ int main(int argc, char **argv)
 			stop_cb, &ctx);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopDefaultMode);
 
+	/* 1ms microframe-visibility poll (see poll_cb / --update-freq) */
+	CFRunLoopTimerContext pctx = { 0, &s, NULL, NULL, NULL };
+	CFRunLoopTimerRef ptimer = CFRunLoopTimerCreate(NULL,
+			CFAbsoluteTimeGetCurrent() + 0.001, 0.001, 0, 0,
+			poll_cb, &pctx);
+	CFRunLoopAddTimer(CFRunLoopGetCurrent(), ptimer, kCFRunLoopDefaultMode);
+
 	CFRunLoopRun();
 
 	/* teardown */
@@ -555,10 +885,23 @@ int main(int argc, char **argv)
 	if (s.do_play)
 		(*u.intf)->AbortPipe(u.intf, u.pipe_iso_out);
 
+	if (s.lowlat) {
+		for (int i = 0; i < N_XFERS; i++)
+			ll_free_xfer(&s, &s.in[i]);
+		if (s.do_play)
+			for (int i = 0; i < N_OUT_XFERS; i++)
+				ll_free_xfer(&s, &s.out[i]);
+	}
+
 	printf("captured %zu bytes (%zu stereo frames), input_panic=%d output_panic=%d, "
 	       "resched in=%d out=%d\n",
 	       s.cap_len, s.cap_len / 6, s.codec.input_panic, s.codec.output_panic,
 	       s.in_errs, s.out_errs);
+	if (s.lowlat)
+		printf("microframe visibility: %ld/%ld polls caught a partial IN xfer "
+		       "(max %d/%d frames filled mid-flight) [update-freq=%d]\n",
+		       s.poll_partial, s.poll_count, s.poll_partial_max,
+		       s.in_fpx, s.update_freq);
 	if (s.do_play)
 		printf("in_completions=%d out_completed=%d out_retries=%d out_drops=%d "
 		       "out_underruns=%d\n",
