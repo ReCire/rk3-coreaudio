@@ -20,6 +20,7 @@
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <os/log.h>
+#include <math.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -41,6 +42,8 @@ enum {
 	kObjID_Device        = 2,
 	kObjID_Stream_Input  = 3,
 	kObjID_Stream_Output = 4,
+	kObjID_Volume_Output = 5,   /* master output volume control (software gain) */
+	kObjID_Mute_Output   = 6,   /* master output mute control (software) */
 };
 
 #define kDevice_UID          "RigKontrol3:17cc:1940"
@@ -106,6 +109,64 @@ static Boolean rate_is_supported(Float64 r)
 	for (UInt32 i = 0; i < kNumSupportedRates; i++)
 		if (kSupportedRates[i] == r) return true;
 	return false;
+}
+
+/*
+ * Master output volume (software gain). The RK3 has no hardware output-level
+ * control, so without a CoreAudio volume control object the system volume keys /
+ * menu slider are greyed out. We publish one kAudioVolumeControlClassID object on
+ * the output scope and apply the gain to the Float32 mix in Drv_DoIOOperation.
+ *
+ * The control value is a 0..1 scalar mapped linearly in dB over [kMinVolumeDB, 0].
+ * gVolumeGain is the precomputed linear multiplier read on the realtime IO thread
+ * (atomic, no lock); gVolumeScalar is the control's reported value.
+ */
+#define kMinVolumeDB (-64.0f)
+#define kMaxVolumeDB (0.0f)
+static Float32          gVolumeScalar = 1.0f;     /* control value, 0..1 */
+static _Atomic Float32  gVolumeGain   = 1.0f;     /* linear gain, read on IO thread */
+
+static Float32 vol_scalar_to_db(Float32 s)
+{
+	if (s <= 0.0f) return kMinVolumeDB;
+	if (s >= 1.0f) return kMaxVolumeDB;
+	return kMinVolumeDB + (kMaxVolumeDB - kMinVolumeDB) * s;
+}
+static Float32 vol_db_to_scalar(Float32 db)
+{
+	Float32 s = (db - kMinVolumeDB) / (kMaxVolumeDB - kMinVolumeDB);
+	if (s < 0.0f) s = 0.0f;
+	if (s > 1.0f) s = 1.0f;
+	return s;
+}
+static Float32 vol_scalar_to_gain(Float32 s)
+{
+	if (s <= 0.0f) return 0.0f;            /* true silence at the bottom */
+	if (s >= 1.0f) return 1.0f;
+	return powf(10.0f, vol_scalar_to_db(s) / 20.0f);
+}
+/* Set the control from a 0..1 scalar; updates the realtime gain too. */
+static void vol_set_scalar(Float32 s)
+{
+	if (s < 0.0f) s = 0.0f;
+	if (s > 1.0f) s = 1.0f;
+	gVolumeScalar = s;
+	atomic_store_explicit(&gVolumeGain, vol_scalar_to_gain(s), memory_order_relaxed);
+}
+
+/*
+ * Master output mute. A kAudioMuteControlClassID boolean control on the output
+ * scope so the keyboard mute key / menu-bar mute work. gMuteValue is the reported
+ * control state; gMuted is read on the realtime IO thread (atomic, no lock).
+ */
+static UInt32          gMuteValue = 0;            /* control value, 0/1 */
+static _Atomic UInt32  gMuted     = 0;            /* read on IO thread */
+
+static void mute_set(UInt32 v)
+{
+	v = v ? 1 : 0;
+	gMuteValue = v;
+	atomic_store_explicit(&gMuted, v, memory_order_relaxed);
 }
 
 /*
@@ -367,6 +428,34 @@ static Boolean Drv_HasProperty(AudioServerPlugInDriverRef d, AudioObjectID o,
 			return true;
 		}
 		return false;
+	case kObjID_Volume_Output:
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+		case kAudioObjectPropertyClass:
+		case kAudioObjectPropertyOwner:
+		case kAudioObjectPropertyOwnedObjects:
+		case kAudioControlPropertyScope:
+		case kAudioControlPropertyElement:
+		case kAudioLevelControlPropertyScalarValue:
+		case kAudioLevelControlPropertyDecibelValue:
+		case kAudioLevelControlPropertyDecibelRange:
+		case kAudioLevelControlPropertyConvertScalarToDecibels:
+		case kAudioLevelControlPropertyConvertDecibelsToScalar:
+			return true;
+		}
+		return false;
+	case kObjID_Mute_Output:
+		switch (a->mSelector) {
+		case kAudioObjectPropertyBaseClass:
+		case kAudioObjectPropertyClass:
+		case kAudioObjectPropertyOwner:
+		case kAudioObjectPropertyOwnedObjects:
+		case kAudioControlPropertyScope:
+		case kAudioControlPropertyElement:
+		case kAudioBooleanControlPropertyValue:
+			return true;
+		}
+		return false;
 	default:
 		if (obj_is_stream(o)) {
 			switch (a->mSelector) {
@@ -396,6 +485,9 @@ static OSStatus Drv_IsPropertySettable(AudioServerPlugInDriverRef d, AudioObject
 	switch (a->mSelector) {
 	case kAudioStreamPropertyIsActive:
 	case kAudioDevicePropertyNominalSampleRate:
+	case kAudioLevelControlPropertyScalarValue:
+	case kAudioLevelControlPropertyDecibelValue:
+	case kAudioBooleanControlPropertyValue:
 		*out = true; break;
 	default:
 		*out = false; break;
@@ -423,7 +515,7 @@ static OSStatus Drv_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
 		*outSize = sizeof(CFStringRef); return 0;
 	case kAudioObjectPropertyOwnedObjects:
 		if (o == kObjID_PlugIn) { *outSize = sizeof(AudioObjectID); return 0; }
-		if (o == kObjID_Device) { *outSize = 2 * sizeof(AudioObjectID); return 0; }
+		if (o == kObjID_Device) { *outSize = 4 * sizeof(AudioObjectID); return 0; }
 		*outSize = 0; return 0;
 	case kAudioPlugInPropertyDeviceList:
 		*outSize = sizeof(AudioObjectID); return 0;
@@ -460,6 +552,8 @@ static OSStatus Drv_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
 			*outSize = 2 * sizeof(AudioObjectID);
 		return 0;
 	case kAudioObjectPropertyControlList:
+		if (o == kObjID_Device) { *outSize = 2 * sizeof(AudioObjectID); return 0; }
+		*outSize = 0; return 0;
 	case kAudioDevicePropertyRelatedDevices:
 		*outSize = 0; return 0;
 	case kAudioStreamPropertyVirtualFormat:
@@ -469,6 +563,20 @@ static OSStatus Drv_GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjec
 	case kAudioStreamPropertyAvailablePhysicalFormats:
 		*outSize = kNumSupportedRates * sizeof(AudioStreamRangedDescription);
 		return 0;
+
+	/* ---- volume control ---- */
+	case kAudioControlPropertyScope:
+	case kAudioControlPropertyElement:
+		*outSize = sizeof(UInt32); return 0;
+	case kAudioLevelControlPropertyScalarValue:
+	case kAudioLevelControlPropertyDecibelValue:
+	case kAudioLevelControlPropertyConvertScalarToDecibels:
+	case kAudioLevelControlPropertyConvertDecibelsToScalar:
+		*outSize = sizeof(Float32); return 0;
+	case kAudioLevelControlPropertyDecibelRange:
+		*outSize = sizeof(AudioValueRange); return 0;
+	case kAudioBooleanControlPropertyValue:
+		*outSize = sizeof(UInt32); return 0;
 	}
 	return kAudioHardwareUnknownPropertyError;
 }
@@ -485,8 +593,8 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 	case kAudioObjectPropertyBaseClass:
 		*outSize = sizeof(AudioClassID);
 		*(AudioClassID *)out =
-			(o == kObjID_PlugIn) ? kAudioObjectClassID :
-			(o == kObjID_Device) ? kAudioObjectClassID :
+			(o == kObjID_Volume_Output) ? kAudioLevelControlClassID :
+			(o == kObjID_Mute_Output)   ? kAudioBooleanControlClassID :
 			kAudioObjectClassID;
 		return 0;
 	case kAudioObjectPropertyClass:
@@ -494,6 +602,8 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 		*(AudioClassID *)out =
 			(o == kObjID_PlugIn) ? kAudioPlugInClassID :
 			(o == kObjID_Device) ? kAudioDeviceClassID :
+			(o == kObjID_Volume_Output) ? kAudioVolumeControlClassID :
+			(o == kObjID_Mute_Output)   ? kAudioMuteControlClassID :
 			kAudioStreamClassID;
 		return 0;
 	case kAudioObjectPropertyOwner:
@@ -513,8 +623,9 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 			if (out) ((AudioObjectID *)out)[0] = kObjID_Device;
 		} else if (o == kObjID_Device) {
 			UInt32 n = inSize / sizeof(AudioObjectID);
-			AudioObjectID ids[2] = { kObjID_Stream_Input, kObjID_Stream_Output };
-			if (n > 2) n = 2;
+			AudioObjectID ids[4] = { kObjID_Stream_Input, kObjID_Stream_Output,
+						 kObjID_Volume_Output, kObjID_Mute_Output };
+			if (n > 4) n = 4;
 			*outSize = n * sizeof(AudioObjectID);
 			if (out) memcpy(out, ids, *outSize);
 		} else {
@@ -633,8 +744,48 @@ static OSStatus Drv_GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 		return 0;
 	}
 	case kAudioObjectPropertyControlList:
+		if (o == kObjID_Device) {
+			AudioObjectID ids[2] = { kObjID_Volume_Output, kObjID_Mute_Output };
+			UInt32 avail = inSize / sizeof(AudioObjectID);
+			UInt32 n = 2;
+			if (out && n > avail) n = avail;
+			*outSize = n * sizeof(AudioObjectID);
+			if (out) memcpy(out, ids, *outSize);
+		} else {
+			*outSize = 0;
+		}
+		return 0;
 	case kAudioDevicePropertyRelatedDevices:
 		*outSize = 0; return 0;
+
+	/* ---- volume control ---- */
+	case kAudioControlPropertyScope:
+		*outSize = sizeof(UInt32);
+		*(UInt32 *)out = kAudioObjectPropertyScopeOutput; return 0;
+	case kAudioControlPropertyElement:
+		*outSize = sizeof(UInt32);
+		*(UInt32 *)out = kAudioObjectPropertyElementMain; return 0;
+	case kAudioLevelControlPropertyScalarValue:
+		*outSize = sizeof(Float32); *(Float32 *)out = gVolumeScalar; return 0;
+	case kAudioLevelControlPropertyDecibelValue:
+		*outSize = sizeof(Float32);
+		*(Float32 *)out = vol_scalar_to_db(gVolumeScalar); return 0;
+	case kAudioLevelControlPropertyDecibelRange: {
+		*outSize = sizeof(AudioValueRange);
+		AudioValueRange *r = out;
+		r->mMinimum = kMinVolumeDB; r->mMaximum = kMaxVolumeDB; return 0;
+	}
+	case kAudioLevelControlPropertyConvertScalarToDecibels:
+		/* in/out: caller passes a scalar in *out, we replace it with dB */
+		*outSize = sizeof(Float32);
+		*(Float32 *)out = vol_scalar_to_db(*(Float32 *)out); return 0;
+	case kAudioLevelControlPropertyConvertDecibelsToScalar:
+		*outSize = sizeof(Float32);
+		*(Float32 *)out = vol_db_to_scalar(*(Float32 *)out); return 0;
+
+	/* ---- mute control ---- */
+	case kAudioBooleanControlPropertyValue:
+		*outSize = sizeof(UInt32); *(UInt32 *)out = gMuteValue; return 0;
 
 	/* ---- stream ---- */
 	case kAudioStreamPropertyIsActive:
@@ -695,6 +846,42 @@ static OSStatus Drv_SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID 
 		if (gHost && gHost->RequestDeviceConfigurationChange)
 			gHost->RequestDeviceConfigurationChange(gHost, kObjID_Device,
 					(UInt64)req, NULL);
+		return 0;
+	}
+	case kAudioLevelControlPropertyScalarValue:
+	case kAudioLevelControlPropertyDecibelValue: {
+		if (inSize < sizeof(Float32))
+			return kAudioHardwareBadPropertySizeError;
+		Float32 v = *(const Float32 *)in;
+		vol_set_scalar(a->mSelector == kAudioLevelControlPropertyDecibelValue
+			       ? vol_db_to_scalar(v) : v);
+		/* The scalar and decibel values track each other, so notify both so any
+		 * observing UI (menu slider, Audio MIDI Setup) refreshes. */
+		if (gHost && gHost->PropertiesChanged) {
+			const AudioObjectPropertyAddress changed[2] = {
+				{ kAudioLevelControlPropertyScalarValue,
+				  kAudioObjectPropertyScopeOutput,
+				  kAudioObjectPropertyElementMain },
+				{ kAudioLevelControlPropertyDecibelValue,
+				  kAudioObjectPropertyScopeOutput,
+				  kAudioObjectPropertyElementMain },
+			};
+			gHost->PropertiesChanged(gHost, kObjID_Volume_Output, 2, changed);
+		}
+		return 0;
+	}
+	case kAudioBooleanControlPropertyValue: {
+		if (inSize < sizeof(UInt32))
+			return kAudioHardwareBadPropertySizeError;
+		mute_set(*(const UInt32 *)in);
+		if (gHost && gHost->PropertiesChanged) {
+			const AudioObjectPropertyAddress changed[1] = {
+				{ kAudioBooleanControlPropertyValue,
+				  kAudioObjectPropertyScopeOutput,
+				  kAudioObjectPropertyElementMain },
+			};
+			gHost->PropertiesChanged(gHost, kObjID_Mute_Output, 1, changed);
+		}
 		return 0;
 	}
 	case kAudioStreamPropertyIsActive:
@@ -858,10 +1045,21 @@ static OSStatus Drv_DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID o,
 		const AudioServerPlugInIOCycleInfo *i, void *mainBuf, void *secBuf)
 {
 	(void)d;(void)o;(void)s;(void)c;(void)i;(void)secBuf;
-	if (op == kAudioServerPlugInIOOperationReadInput)
+	if (op == kAudioServerPlugInIOOperationReadInput) {
 		rk3_engine_read_input(&gEngine, (float *)mainBuf, (int)nf);
-	else if (op == kAudioServerPlugInIOOperationWriteMix)
+	} else if (op == kAudioServerPlugInIOOperationWriteMix) {
+		/* Apply the master output mute and volume to the mix in place (WriteMix is
+		 * in-place per Drv_WillDoIOOperation) before handing it to the engine. */
+		Float32 gain = atomic_load_explicit(&gVolumeGain, memory_order_relaxed);
+		if (atomic_load_explicit(&gMuted, memory_order_relaxed))
+			gain = 0.0f;
+		if (gain != 1.0f) {
+			float *m = (float *)mainBuf;
+			UInt32 n = nf * 2;            /* stereo interleaved */
+			for (UInt32 k = 0; k < n; k++) m[k] *= gain;
+		}
 		rk3_engine_write_output(&gEngine, (const float *)mainBuf, (int)nf);
+	}
 	return 0;
 }
 
