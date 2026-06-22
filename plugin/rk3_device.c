@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <os/log.h>
 #include <string.h>
+#include <unistd.h>
 
 /* ---- logging --------------------------------------------------------- */
 
@@ -85,6 +86,19 @@ static struct rk3_engine gEngine;       /* zero-initialized */
 static UInt32 gIOCount = 0;             /* StartIO/StopIO refcount */
 
 /*
+ * Single-owner USB lifecycle. The engine claims the RK3 interface as soon as the
+ * plugin loads — not only while audio streams — so the foot-controls MIDI relay
+ * works with no audio. A supervisor thread (spawned in Initialize) opens the
+ * engine, retries while the device is absent/claimed, and recycles it if the
+ * device is unplugged. StartIO/StopIO then merely layer the isoc audio chains on
+ * top via rk3_engine_audio_start/stop. All gEngine/gEngineOpen/gIOCount access is
+ * under gStateMutex; the supervisor and StartIO both open only under that lock, so
+ * the device is never opened twice. */
+static int       gEngineOpen = 0;       /* engine currently holds USB (under mutex) */
+static pthread_t gSupervisor;
+static int       gSupervisorUp = 0;     /* supervisor thread spawned (under mutex) */
+
+/*
  * Zero-timestamp clock + fill servo. The timeline is a line through the anchor
  * point (gAnchorHostTime, gAnchorSampleTime) with slope gTicksPerFrame. The servo
  * adjusts the slope (gServoTrim) to hold the engine's OUT-ring fill at the
@@ -110,6 +124,48 @@ static const AudioStreamBasicDescription kFormat = {
 	.mChannelsPerFrame = 2,
 	.mBitsPerChannel   = 32,
 };
+
+/* ===================================================================== *
+ *  Engine USB supervisor (single-owner lifecycle)
+ * ===================================================================== */
+
+/* Open the engine. MUST be called with gStateMutex held and gEngineOpen == 0.
+ * rk3_engine_open is fast when the device is absent (find_device misses), so
+ * holding the lock across it is cheap. Returns 1 on success. */
+static int engine_open_locked(void)
+{
+	memset(&gEngine, 0, sizeof(gEngine));
+	if (rk3_engine_open(&gEngine, (int)kSampleRate) != 0)
+		return 0;
+	gEngineOpen = 1;
+	DLOG("engine open: USB claimed (MIDI relay live; audio idle)");
+	return 1;
+}
+
+/*
+ * Acquire the RK3 as soon as the plugin loads and keep it: retry while it is
+ * absent/claimed, and recycle the engine if it is unplugged (usb_dead) while
+ * audio is idle. Removal during active audio is left to coreaudiod's StopIO
+ * (recycled on the next tick once gIOCount returns to 0) so we never tear down
+ * the engine under a live IO cycle.
+ */
+static void *engine_supervisor(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		pthread_mutex_lock(&gStateMutex);
+		if (!gEngineOpen) {
+			engine_open_locked();          /* quietly retry if it fails */
+		} else if (gIOCount == 0 && rk3_engine_usb_dead(&gEngine)) {
+			DLOG("supervisor: device gone — closing engine; reopen on attach");
+			rk3_engine_close(&gEngine);
+			gEngineOpen = 0;
+		}
+		pthread_mutex_unlock(&gStateMutex);
+		usleep(2 * 1000 * 1000);               /* 2 s poll */
+	}
+	return NULL;
+}
 
 /* ===================================================================== *
  *  IUnknown / factory
@@ -149,6 +205,17 @@ static OSStatus Drv_Initialize(AudioServerPlugInDriverRef inDriver,
 	gNominalTicksPerFrame = ticksPerSec / kSampleRate;
 	gTicksPerFrame = gNominalTicksPerFrame;
 	DLOG("Initialize: nominalTicksPerFrame=%.3f", gNominalTicksPerFrame);
+
+	/* Spawn the USB supervisor so the engine claims the RK3 (and the MIDI relay
+	 * goes live) without waiting for an audio client. */
+	pthread_mutex_lock(&gStateMutex);
+	if (!gSupervisorUp) {
+		if (pthread_create(&gSupervisor, NULL, engine_supervisor, NULL) == 0)
+			gSupervisorUp = 1;
+		else
+			DLOG("Initialize: supervisor thread create failed (MIDI needs audio)");
+	}
+	pthread_mutex_unlock(&gStateMutex);
 	return 0;
 }
 
@@ -554,9 +621,16 @@ static OSStatus Drv_StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt3
 	OSStatus rc = 0;
 	pthread_mutex_lock(&gStateMutex);
 	if (gIOCount == 0) {
-		memset(&gEngine, 0, sizeof(gEngine));
-		if (rk3_engine_start(&gEngine, (int)kSampleRate) != 0) {
-			DLOG("StartIO: engine_start FAILED (device absent/claimed?)");
+		/* The supervisor normally has the engine open already; if not (device
+		 * just appeared and we beat the 2 s poll), open it now under the lock —
+		 * same lock the supervisor opens under, so no double-open race. */
+		if (!gEngineOpen)
+			engine_open_locked();
+		if (!gEngineOpen) {
+			DLOG("StartIO: engine not open (device absent/claimed?)");
+			rc = kAudioHardwareNotRunningError;
+		} else if (rk3_engine_audio_start(&gEngine) != 0) {
+			DLOG("StartIO: audio_start FAILED");
 			rc = kAudioHardwareNotRunningError;
 		} else {
 			gAnchorHostTime = mach_absolute_time();
@@ -566,7 +640,7 @@ static OSStatus Drv_StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt3
 			gFillAvg = -1.0;
 			gNumberTimeStamps = 0;
 			gIOCount = 1;
-			DLOG("StartIO: engine running");
+			DLOG("StartIO: audio running");
 		}
 	} else {
 		gIOCount++;
@@ -580,8 +654,9 @@ static OSStatus Drv_StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32
 	(void)d;(void)o;(void)c;
 	pthread_mutex_lock(&gStateMutex);
 	if (gIOCount > 0 && --gIOCount == 0) {
-		rk3_engine_stop(&gEngine);
-		DLOG("StopIO: engine stopped");
+		/* Stop only the audio chains; the engine keeps USB + the MIDI relay up. */
+		rk3_engine_audio_stop(&gEngine);
+		DLOG("StopIO: audio stopped (engine + MIDI stay up)");
 	}
 	pthread_mutex_unlock(&gStateMutex);
 	return 0;

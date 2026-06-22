@@ -211,10 +211,17 @@ struct rk3_engine {
 	int rate;
 	int bpp;
 
-	atomic_int running;        /* 1 while the isoc chains should resubmit */
+	atomic_int running;        /* 1 while the engine thread/runloop is alive */
+	atomic_int audio_running;  /* 1 while the isoc audio chains should resubmit.
+	                            * Distinct from `running`: USB + the MIDI relay
+	                            * stay up (running=1) across StartIO/StopIO so the
+	                            * foot controls work even with no audio streaming;
+	                            * only the isoc chains toggle with audio_running. */
+	atomic_int usb_dead;       /* set when a USB completion reports device-gone;
+	                            * the plugin supervisor watches this to recycle. */
 	pthread_t thread;
 	CFRunLoopRef runloop;      /* engine thread's run loop (for stop) */
-	atomic_int thread_ready;   /* set once the chains are primed */
+	atomic_int thread_ready;   /* set once the thread is up (or failed) */
 	int start_rc;              /* startup result reported back to caller */
 
 	struct rk3_iso_xfer in[RK3_N_XFERS];
@@ -258,17 +265,91 @@ struct rk3_engine {
 	unsigned dbg_ctr;
 	UInt64 dbg_host0;
 	unsigned long long dbg_devframes0;
+
+	/*
+	 * MIDI relay (engine thread only). The RK3 foot buttons + pedal arrive as
+	 * caiaq reports on bulk EP 0x81 IN; we self-resubmit an async read on
+	 * pipe_cmd_in and forward each raw report over loopback UDP to the user-space
+	 * MIDI helper (the coreaudiod sandbox blocks CoreMIDI directly). Best-effort:
+	 * every failure here is logged and ignored — it must never disturb audio.
+	 */
+	int        midi_fd;            /* connected UDP socket, -1 if disabled */
+	atomic_int midi_running;       /* gates the self-resubmitting EP1 read */
+	int        midi_send_errs;     /* relay send failures (logged, capped) */
+	uint8_t    midi_buf[512];      /* async bulk-read buffer for EP 0x81 */
+	unsigned   midi_cb_ctr;        /* completions since last rate check (storm guard) */
+	UInt64     midi_cb_t0;         /* mach time at last rate-check window start */
+	int        midi_storm_tripped; /* engine-thread only: 1 after the storm guard
+	                                * disabled the relay; the sentinel poller will
+	                                * not re-arm until the sentinel is removed and
+	                                * re-created (rm + touch), so a pathological
+	                                * device cannot be re-armed into a loop. */
+
+	/*
+	 * LED / 7-segment listener (engine thread only). The engine binds a loopback
+	 * UDP socket on its run loop; each datagram is a raw control_state buffer that
+	 * is written straight to the device via EP1_CMD_WRITE_IO. Stateless (the
+	 * caller always sends the whole buffer, as the RK3 protocol requires) and
+	 * best-effort — every failure is logged and ignored so it cannot disturb
+	 * audio. There is no self-resubmit loop here (CFSocket fires only on real
+	 * inbound datagrams), so no storm guard is needed.
+	 */
+	CFSocketRef        led_sock;   /* wraps the bound UDP fd, NULL if unavailable */
+	CFRunLoopSourceRef led_src;    /* run-loop source for led_sock */
+	unsigned           led_writes; /* WRITE_IO commands completed (telemetry) */
+	int                led_errs;   /* WRITE_IO failures (logged, capped) */
+	/*
+	 * The WRITE_IO is issued ASYNCHRONOUSLY (WritePipeAsync), never synchronously:
+	 * a blocking WritePipeTO on this run-loop thread freezes the isoc servicing and
+	 * melts the audio stream (the OUT ring balloons, dev_rate collapses — observed
+	 * 2026-06-21). led_wbuf holds the command for the duration of the async call
+	 * (cmd byte + control_state) and led_busy serializes to one in-flight write;
+	 * datagrams arriving while busy are dropped (best-effort, sub-ms writes so the
+	 * 0.4 s walk never collides).
+	 */
+	uint8_t            led_wbuf[EP1_BUFSIZE];
+	int                led_busy;
 };
 
 /*
- * Open the RK3, run the EP1 handshake + AUDIO_PARAMS for `rate`, prime the isoc
- * chains, and start the engine thread. Returns 0 on success, negative on error
- * (device absent, claimed, or handshake failure). On failure the engine is left
- * closed and may be retried.
+ * Single-owner lifecycle. Because all four endpoints share one USB interface
+ * and macOS lets only one process open it, the engine (inside coreaudiod) is the
+ * sole owner of the interface for its whole life — MIDI and audio both. The
+ * interface is acquired ONCE at rk3_engine_open and held until rk3_engine_close;
+ * audio streaming is layered on top with rk3_engine_audio_start/stop. This makes
+ * the foot-controls MIDI relay work with no audio streaming, and removes the
+ * interface-handoff race entirely (there is never a second USB owner).
+ *
+ *   open        -> claim USB, run the EP1 handshake (device-info / bpp), start the
+ *                  engine thread + run loop. The MIDI relay then arms itself when
+ *                  the sentinel /tmp/rk3_midi_on is present (polled live). No audio
+ *                  params are set and no isoc chains run yet.
+ *   audio_start -> set AUDIO_PARAMS, reset the rings, prime the isoc chains. Call
+ *                  from CoreAudio StartIO.
+ *   audio_stop  -> abort the isoc pipes; USB + the MIDI relay stay up. Call from
+ *                  CoreAudio StopIO.
+ *   close       -> abort everything, join the thread, release USB.
+ *
+ * open/audio_start return 0 on success, negative on error (device absent, claimed,
+ * or handshake/params failure). audio_start/stop are safe no-ops if the engine is
+ * not open. The marshaling of prime/abort onto the engine thread is internal.
+ */
+int  rk3_engine_open(struct rk3_engine *e, int rate);
+void rk3_engine_close(struct rk3_engine *e);
+int  rk3_engine_audio_start(struct rk3_engine *e);
+void rk3_engine_audio_stop(struct rk3_engine *e);
+
+/*
+ * 1 if a USB completion reported the device gone (unplugged) since open. The
+ * plugin supervisor polls this to close + reopen the engine on the next attach.
+ */
+int  rk3_engine_usb_dead(struct rk3_engine *e);
+
+/*
+ * Convenience composites (open+audio_start / audio_stop+close) preserving the
+ * original one-shot API for the stream/test tools. The plugin uses the split API.
  */
 int  rk3_engine_start(struct rk3_engine *e, int rate);
-
-/* Stop the chains, abort the pipes, join the thread, close USB. Idempotent. */
 void rk3_engine_stop(struct rk3_engine *e);
 
 /*

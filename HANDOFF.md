@@ -10,6 +10,81 @@ Approach (user-confirmed): **userspace CoreAudio AudioServerPlugin (HAL plugin) 
 IOKit IOUSBLib**, NOT a DriverKit dext. Goal: full-duplex audio in+out.
 Plan file: `/Users/mihai/.claude/plans/this-folder-contains-the-jolly-beacon.md`
 
+## CURRENT TASK — MIDI without audio: SINGLE-OWNER engine (2026-06-21)
+
+**Goal (user, 2026-06-21):** make the foot-controls MIDI work **even when no audio is
+streaming** — not only while the audio driver streams. Buttons 1–9 → CC20–28 127/0 ch1;
+pedal → CC11 ch1.
+
+**Hard constraint (unchanged):** all 4 endpoints share ONE USB interface; macOS lets only
+one process `USBInterfaceOpen` it. Earlier Phase-2 design folded the relay into the engine,
+but the engine only owned USB during `StartIO` → MIDI only flowed while audio streamed.
+
+**Architecture chosen (user-confirmed 2026-06-21): SINGLE OWNER in coreaudiod.** The engine
+(inside coreaudiod) claims the interface as soon as the plugin loads — for MIDI **and**
+audio — and holds it for its whole life. Audio isoc chains are layered on/off at
+StartIO/StopIO. Because the engine is the *only* USB owner ever, there is **no interface
+handoff** and the wedge-race class is structurally gone. The user-space helper still owns
+the "RigKontrol 3" CoreMIDI source and receives reports over **UDP 127.0.0.1:17890**
+(coreaudiod's sandbox blocks `MIDIClientCreate` → `-10833`, and UDP loopback is the proven
+egress; both de-risked on hw earlier).
+
+**IMPLEMENTED + HW-VALIDATED (2026-06-21):** MIDI without audio confirmed on hardware —
+log shows `engine USB up … audio idle` at Initialize (not StartIO) and `engine open: USB
+claimed (MIDI relay live; audio idle)`; with `/tmp/rk3_midi_on` present and NO audio stream,
+the helper received buttons 1–9 → CC20–28 127/0 and pedal `analog2 raw=48 → CC11`. No storm
+trip during the session. Details:
+- `rk3_engine.{h,c}` — lifecycle split into `rk3_engine_open` (claim USB + handshake +
+  spawn thread/run-loop; **no** AUDIO_PARAMS, **no** isoc), `rk3_engine_audio_start`/
+  `_audio_stop` (set AUDIO_PARAMS + prime/abort isoc), `rk3_engine_close`. Isoc callbacks
+  now gate on new `audio_running` (not `running`, which means "thread alive"). `engine_sync`
+  marshals prime/abort onto the engine run loop from the StartIO/StopIO thread (bounded
+  wait). `rk3_engine_start/stop` kept as composites for the tools. `rk3_engine_usb_dead`
+  exposes a removal flag.
+- **MIDI relay is now audio-independent + a LIVE sentinel toggle.** A ~1 Hz
+  `CFRunLoopTimer` (`midi_sentinel_tick`) on the engine run loop watches `/tmp/rk3_midi_on`
+  and arms/disarms the relay to match — so `touch`/`rm` enable/disable MIDI **live, with no
+  reinstall and no audio needed**. Storm guard kept; on a storm trip it now **latches**
+  (`midi_storm_tripped`) so the poller won't re-arm until the sentinel is `rm`'d + re-touched.
+  Device-removal result codes (`kIOReturnNoDevice`/`NotResponding`/`NotAttached`) set
+  `usb_dead`.
+- `plugin/rk3_device.c` — a **supervisor thread** (spawned in `Drv_Initialize`) opens the
+  engine at load, **retries every 2 s** while the device is absent/claimed, and recycles it
+  on `usb_dead` while audio is idle. `StartIO` → `audio_start` (opens on demand under the
+  same mutex if the supervisor hasn't yet), `StopIO` → `audio_stop` (engine + MIDI **stay
+  up**). All `gEngine/gEngineOpen/gIOCount` under `gStateMutex`; open happens only under that
+  lock so the device is never opened twice.
+- **Critical correctness point baked in:** `AUDIO_PARAMS` reads its ack on EP 0x81 — the
+  SAME bulk-in pipe the relay's async read uses. `audio_start` therefore runs the command
+  I/O *on the engine thread* and quiesces the relay (abort EP 0x81) around it, then re-arms.
+  Two readers on one pipe = bug; this avoids it.
+
+**⚠️ Storm history (still relevant):** an earlier relay test (zero-delay self-resubmit)
+stormed coreaudiod to a reboot. The storm guard (256-cb window / 50 ms floor → disable) is
+the real protection and is retained. The opt-in sentinel is the belt-and-suspenders: the
+storm fix is still **UNTESTED on hardware**, so the default install is byte-for-byte the
+known-good audio path until the user `touch`es the sentinel.
+
+**NEXT (test, do gently — install is the reboot-risky step; idle the device + quit audio
+apps first):**
+1. `make install-driver` (SAFE: relay dormant w/o sentinel; engine now opens USB at load).
+   Verify audio still fine in Reaper, and `make driver-log` shows `engine USB up … audio idle`.
+2. `./build/rk3midihelper -v` (or `make install-midihelper`).
+3. **MIDI with NO audio (the new capability):** `touch /tmp/rk3_midi_on` — within ~1 s the
+   log shows `arming foot-controls relay`; press buttons / move pedal → helper prints CCs,
+   **no audio stream needed.** `rm /tmp/rk3_midi_on` → disarms live.
+4. **MIDI + audio:** start RK3 audio in Reaper with the sentinel present; controls keep
+   working alongside audio (relay is quiesced only briefly across AUDIO_PARAMS).
+   - Storm trips → `driver-log`: `completion storm … last result=0x……` (capture the code).
+     Latched off; `rm` + re-`touch` to retry. Then switch to `ReadPipeAsyncTO`/poll-thread.
+   - Removal while idle → supervisor logs `device gone … reopen on attach`; replug recovers.
+
+Full blow-by-blow detail in memory: `rk3-coreaudio-project.md` +
+`rk3-coreaudio-hardware-facts.md` (button bit-scramble, pedal axis2 raw 40–270, LED/display
+programmability for the deferred output phase).
+
+---
+
 ## TL;DR status
 
 - **STEP 4 CORE DONE & validated (2026-06-21): the RK3 is a working CoreAudio device.** The

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>RK3MidiProbe</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.mihai.rk3.midiprobe</string>
+	<key>CFBundleName</key>
+	<string>RK3MidiProbe</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>C221638A-F9EE-4A3C-A3D8-3A1A7B547584</key>
+		<string>RK3MidiProbeFactory</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- kAudioServerPlugInTypeUUID -->
+		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<array>
+			<string>C221638A-F9EE-4A3C-A3D8-3A1A7B547584</string>
+		</array>
+	</dict>
+</dict>
+</plist>
