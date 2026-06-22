@@ -65,4 +65,8 @@ int  rk3_bulk_write(struct rk3_usb *u, const void *buf, size_t len,
 int  rk3_bulk_read(struct rk3_usb *u, void *buf, size_t *len,
 		   unsigned timeout_ms);
 
+/* Clear a halted (stalled) bulk pipe on both ends. Pass a pipe ref from
+ * struct rk3_usb (e.g. u->pipe_cmd_out). No-op on a null pipe/interface. */
+void rk3_clear_stall(struct rk3_usb *u, uint8_t pipe);
+
 #endif /* RK3_USB_IOKIT_H */

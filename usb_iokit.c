@@ -215,11 +215,28 @@ void rk3_usb_close(struct rk3_usb *u)
 	}
 }
 
+void rk3_clear_stall(struct rk3_usb *u, uint8_t pipe)
+{
+	if (u->intf && pipe)
+		(*u->intf)->ClearPipeStallBothEnds(u->intf, pipe);
+}
+
 int rk3_bulk_write(struct rk3_usb *u, const void *buf, size_t len,
 		   unsigned timeout_ms)
 {
 	IOReturn kr = (*u->intf)->WritePipeTO(u->intf, u->pipe_cmd_out,
 			(void *)buf, (UInt32)len, timeout_ms, timeout_ms);
+	if (kr == kIOUSBPipeStalled) {
+		/* A rejected/unsupported command halts the pipe; clear it so the
+		 * device isn't wedged for every later command, then retry once. */
+		rk3_clear_stall(u, u->pipe_cmd_out);
+		kr = (*u->intf)->WritePipeTO(u->intf, u->pipe_cmd_out,
+				(void *)buf, (UInt32)len, timeout_ms, timeout_ms);
+		/* If the command is genuinely rejected the retry re-stalls; clear
+		 * again so the NEXT command starts on a clean (un-halted) pipe. */
+		if (kr == kIOUSBPipeStalled)
+			rk3_clear_stall(u, u->pipe_cmd_out);
+	}
 	if (kr != kIOReturnSuccess) {
 		fprintf(stderr, "rk3_bulk_write: 0x%08x\n", kr);
 		return -1;
@@ -235,6 +252,10 @@ int rk3_bulk_read(struct rk3_usb *u, void *buf, size_t *len,
 			buf, &size, timeout_ms, timeout_ms);
 	if (kr == kIOReturnTimeout || kr == kIOUSBTransactionTimeout)
 		return RK3_ETIMEOUT;
+	if (kr == kIOUSBPipeStalled) {
+		rk3_clear_stall(u, u->pipe_cmd_in);
+		return RK3_ETIMEOUT; /* treat as "no data" so callers retry */
+	}
 	if (kr != kIOReturnSuccess) {
 		fprintf(stderr, "rk3_bulk_read: 0x%08x\n", kr);
 		return -1;
