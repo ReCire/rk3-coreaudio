@@ -250,8 +250,14 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
  * not a storm. The drain still fires ~5.5 s in, so measure with `iotest 10 --latency`
  * (the MIN over impulses = the post-drain steady latency) and watch cap_fill (min) in
  * the log — raise the floor if the post-drain trough dips toward 0.
+ *
+ * 2026-06-22 (Tier 3) — 140 -> 120: reclaim ~20 frames (~0.4 ms) of IN standing fill.
+ * This is the RISKY notch (handoff flagged it): it eats into the already-thin post-drain
+ * capture trough, so the failure mode is a CAPTURE underrun (input click), not a storm.
+ * MEASURE: watch cap_fill (min) + in_errs/in underruns in the driver-log across a full
+ * 10 s run; if the trough dips toward 0 or input clicks, REVERT to 140 (one line).
  */
-#define RK3_CAP_FILL_FLOOR    140
+#define RK3_CAP_FILL_FLOOR    120
 #define RK3_CAP_SETTLE_FRAMES  (5 * 48000)         /* ~5 s: the IN transient (dev_rate 48200->48013
                                                     * AND the cap balloon) is still building at 2 s;
                                                     * measuring then is garbage. Wait it out fully. */
