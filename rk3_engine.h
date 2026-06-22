@@ -195,6 +195,13 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
                                                     * measuring then is garbage. Wait it out fully. */
 #define RK3_CAP_MEASURE_FRAMES (48000 / 2)         /* ~0.5 s window to find the (now stable) trough */
 
+/* The constants above are all expressed at the 48 kHz reference rate. They are
+ * fixed amounts of time / producer-consumer bite, so they scale linearly with the
+ * actual sample rate. Scale a 48k-reference frame count to the running rate. */
+#define RK3_RATE_REF 48000
+#define RK3_SCALE_TO_RATE(base48k, rate) \
+	((int)(((long long)(base48k) * (rate)) / RK3_RATE_REF))
+
 struct rk3_engine;
 
 struct rk3_iso_xfer {
@@ -210,6 +217,25 @@ struct rk3_engine {
 	struct caiaq_codec codec;
 	int rate;
 	int bpp;
+	/*
+	 * Saved from the GET_DEVICE_INFO handshake so bpp can be recomputed when the
+	 * rate changes (rk3_engine_set_rate) without re-running the handshake.
+	 */
+	int data_alignment;
+	int n_streams;
+	/*
+	 * Rate-scaled copies of the fill-control constants (all of RK3_OUT_CUSHION /
+	 * RK3_OUT_FILL_SETPOINT / RK3_CAP_FILL_FLOOR / RK3_CAP_SETTLE_FRAMES /
+	 * RK3_CAP_MEASURE_FRAMES are tuned in absolute frames at 48 kHz; they describe
+	 * fixed amounts of TIME and producer/consumer bites that both scale linearly
+	 * with the sample rate). Recomputed by engine_apply_rate_scale at open and on
+	 * every rk3_engine_set_rate so behaviour matches at 44.1/48/96/192 kHz.
+	 */
+	int out_cushion;        /* bytes (frame-aligned): initial OUT standing fill */
+	int out_fill_setpoint;  /* frames: servo steady-state OUT fill target */
+	int cap_fill_floor;     /* frames: capture-drain trough floor */
+	int cap_settle_init;    /* frames: settle wait before measuring the cap trough */
+	int cap_measure_init;   /* frames: cap-trough measurement window */
 
 	atomic_int running;        /* 1 while the engine thread/runloop is alive */
 	atomic_int audio_running;  /* 1 while the isoc audio chains should resubmit.
@@ -338,6 +364,19 @@ int  rk3_engine_open(struct rk3_engine *e, int rate);
 void rk3_engine_close(struct rk3_engine *e);
 int  rk3_engine_audio_start(struct rk3_engine *e);
 void rk3_engine_audio_stop(struct rk3_engine *e);
+
+/*
+ * Change the audio sample rate. Recomputes bpp (from the rate + the device_spec
+ * saved at open) and the rate-scaled fill constants; the new params take effect at
+ * the next rk3_engine_audio_start (which re-sends AUDIO_PARAMS). MUST be called
+ * with audio stopped (the CoreAudio rate-change handshake stops IO first). Returns
+ * 0 on success, -1 if the rate is not one the device supports.
+ */
+int  rk3_engine_set_rate(struct rk3_engine *e, int rate);
+
+/* Servo steady-state OUT-fill target in frames, rate-scaled (RK3_OUT_FILL_SETPOINT
+ * at 48 kHz). Read by the driver's rate servo + latency reporting. */
+int  rk3_engine_out_fill_setpoint(const struct rk3_engine *e);
 
 /*
  * 1 if a USB completion reported the device gone (unplugged) since open. The

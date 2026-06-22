@@ -782,8 +782,8 @@ static void reset_audio_state(struct rk3_engine *e)
 	atomic_store(&e->cap_w, 0);
 	atomic_store(&e->cap_r, 0);
 	atomic_store(&e->cap_primed, 0);
-	e->cap_settle_left = RK3_CAP_SETTLE_FRAMES;
-	e->cap_measure_left = RK3_CAP_MEASURE_FRAMES;
+	e->cap_settle_left = e->cap_settle_init;
+	e->cap_measure_left = e->cap_measure_init;
 	e->cap_meas_min = ~0u;
 	e->out_fill_min = ~0u;
 	e->cap_fill_min = ~0u;
@@ -801,6 +801,48 @@ static void reset_audio_state(struct rk3_engine *e)
 }
 
 /* ---- public API ------------------------------------------------------ */
+
+/* Recompute the rate-scaled fill constants from e->rate. The reference values are
+ * tuned at 48 kHz and describe fixed amounts of time / producer-consumer bite, so
+ * they scale linearly with the rate. Called at open and on every set_rate. */
+static void engine_apply_rate_scale(struct rk3_engine *e)
+{
+	e->out_cushion       = RK3_SCALE_TO_RATE(RK3_OUT_CUSHION, e->rate);
+	e->out_cushion      -= e->out_cushion % RK3_BYTES_PER_FRAME;  /* keep frame-aligned */
+	e->out_fill_setpoint = RK3_SCALE_TO_RATE(RK3_OUT_FILL_SETPOINT, e->rate);
+	e->cap_fill_floor    = RK3_SCALE_TO_RATE(RK3_CAP_FILL_FLOOR, e->rate);
+	e->cap_settle_init   = RK3_SCALE_TO_RATE(RK3_CAP_SETTLE_FRAMES, e->rate);
+	e->cap_measure_init  = RK3_SCALE_TO_RATE(RK3_CAP_MEASURE_FRAMES, e->rate);
+}
+
+/* Rates the caiaq protocol + this engine accept (caiaq_set_audio_params codes). */
+static int rate_supported(int rate)
+{
+	return rate == 44100 || rate == 48000 || rate == 88200 ||
+	       rate == 96000 || rate == 192000;
+}
+
+int rk3_engine_set_rate(struct rk3_engine *e, int rate)
+{
+	if (!rate_supported(rate)) {
+		ELOG("set_rate: unsupported rate %d", rate);
+		return -1;
+	}
+	if (atomic_load_explicit(&e->audio_running, memory_order_acquire)) {
+		ELOG("set_rate: refused while audio running");
+		return -1;
+	}
+	e->rate = rate;
+	e->bpp = caiaq_compute_bpp(rate, e->data_alignment, e->n_streams);
+	engine_apply_rate_scale(e);
+	ELOG("set_rate: rate=%d bpp=%d (takes effect at next audio_start)", e->rate, e->bpp);
+	return 0;
+}
+
+int rk3_engine_out_fill_setpoint(const struct rk3_engine *e)
+{
+	return e->out_fill_setpoint;
+}
 
 int rk3_engine_open(struct rk3_engine *e, int rate)
 {
@@ -836,7 +878,10 @@ int rk3_engine_open(struct rk3_engine *e, int rate)
 	}
 	int n_streams = spec.num_analog_audio_in / 2;
 	if (n_streams < 1) n_streams = 1;
+	e->data_alignment = spec.data_alignment;
+	e->n_streams = n_streams;
 	e->bpp = caiaq_compute_bpp(rate, spec.data_alignment, n_streams);
+	engine_apply_rate_scale(e);
 
 	if (pthread_create(&e->thread, NULL, engine_thread, e) != 0) {
 		rk3_usb_close(&e->usb);
@@ -1024,8 +1069,9 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 			if (hf < e->cap_meas_min) e->cap_meas_min = hf;  /* find the trough */
 			e->cap_measure_left -= nframes;
 		} else {
-			if (e->cap_meas_min != ~0u && e->cap_meas_min > RK3_CAP_FILL_FLOOR) {
-				unsigned drop = (e->cap_meas_min - RK3_CAP_FILL_FLOOR)
+			if (e->cap_meas_min != ~0u &&
+			    e->cap_meas_min > (unsigned)e->cap_fill_floor) {
+				unsigned drop = (e->cap_meas_min - e->cap_fill_floor)
 						* RK3_BYTES_PER_FRAME;
 				r = (r + drop) % RK3_RING_BYTES;   /* trough -> floor */
 			}
@@ -1075,7 +1121,7 @@ void rk3_engine_write_output(struct rk3_engine *e, const float *src, int nframes
 	 * which reads pb_started with acquire, sees the seeded pb_r.
 	 */
 	if (!atomic_load_explicit(&e->pb_started, memory_order_relaxed) &&
-	    w >= (unsigned)RK3_OUT_CUSHION) {
+	    w >= (unsigned)e->out_cushion) {
 		atomic_store_explicit(&e->pb_r, RK3_OUT_PHASE, memory_order_relaxed);
 		atomic_store_explicit(&e->pb_started, 1, memory_order_release);
 	}
