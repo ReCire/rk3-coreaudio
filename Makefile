@@ -25,6 +25,7 @@ ENGINE_SRC := usb_iokit.c caiaq_protocol.c codec_mode2.c rk3_engine.c
         sandboxprobe install-probe uninstall-probe probe-log \
         midiprobe install-midi-probe uninstall-midi-probe midi-probe-log \
         driver install-driver uninstall-driver driver-log rk3midi rk3led \
+        rk3monitor \
         midihelper install-midihelper uninstall-midihelper midihelper-log
 
 all: usbprobe handshake codectest stream epdump
@@ -53,6 +54,13 @@ $(BUILD)/usbprobe: tools/usbprobe.c | $(BUILD)
 $(BUILD)/handshake: tools/handshake.c $(PROTO_SRC) usb_iokit.h caiaq_protocol.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/handshake.c $(PROTO_SRC) $(FRAMEWORKS) -o $@
 	@echo "Built $@ — run it with the RigKontrol 3 plugged in."
+
+# Hardware direct-monitoring (EP1 0x0e) sweep tool — discovers the mode byte.
+# Cannot run while the audio driver is streaming (shared USB interface).
+rk3monitor: $(BUILD)/rk3monitor
+$(BUILD)/rk3monitor: tools/rk3monitor.c $(PROTO_SRC) usb_iokit.h caiaq_protocol.h | $(BUILD)
+	$(CC) $(CFLAGS) tools/rk3monitor.c $(PROTO_SRC) $(FRAMEWORKS) -o $@
+	@echo "Built $@ — run ./build/rk3monitor with the RK3 plugged in (audio idle)."
 
 # Standalone "RK3 controls -> MIDI" bridge (CoreMIDI virtual source).
 # Cannot run while the audio driver is streaming (shared USB interface).

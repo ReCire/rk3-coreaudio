@@ -1086,6 +1086,15 @@ int rk3_engine_audio_start(struct rk3_engine *e)
 				params_rc = -1;   /* propagate to the failure check below */
 		}
 
+		/*
+		 * NOTE: hardware direct monitoring (EP1 0x0e) was investigated here and
+		 * confirmed INERT on the RK3 — the firmware ACKs the command but there is
+		 * no analog/DSP monitor mixer behind it (the RK3 has a single stereo out,
+		 * no Monitor channel pair, unlike NI's larger interfaces). Monitoring on
+		 * this device must go through the host. See caiaq_set_direct_mon() (kept
+		 * as documentation) and the project memory for the full negative result.
+		 */
+
 		/* Re-arm MIDI so the controls keep working alongside audio (or, on a
 		 * params failure, while idle — MIDI is independent of audio). */
 		if (relay_was_on) {

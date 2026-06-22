@@ -144,3 +144,33 @@ int caiaq_set_audio_params(struct rk3_usb *u, int rate, int depth, int bpp)
 
 	return 0;
 }
+
+int caiaq_set_direct_mon(struct rk3_usb *u, uint8_t mode)
+{
+	/* setDirectMonitoringMode (NI kext): EP1 0x0e, one-byte payload. */
+	return caiaq_send_command(u, EP1_CMD_DIRECT_MON, &mode, 1);
+}
+
+int caiaq_get_direct_mon(struct rk3_usb *u, uint8_t *mode_out)
+{
+	uint8_t buf[EP1_BUFSIZE];
+	size_t len = 0;
+	int rc;
+
+	rc = caiaq_send_command(u, EP1_CMD_GET_DIRECT_MON, NULL, 0);
+	if (rc != 0)
+		return rc;
+
+	rc = read_reply(u, EP1_CMD_GET_DIRECT_MON, buf, sizeof(buf), &len);
+	if (rc != 0) {
+		fprintf(stderr, "caiaq_get_direct_mon: no reply\n");
+		return -1;
+	}
+
+	/* buf[0] echoes the cmd; buf[1] is the current mode byte. */
+	if (len < 2)
+		return -1;
+	if (mode_out)
+		*mode_out = buf[1];
+	return 0;
+}

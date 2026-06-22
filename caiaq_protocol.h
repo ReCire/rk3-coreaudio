@@ -24,6 +24,8 @@
 #define EP1_CMD_AUDIO_PARAMS    0x9
 #define EP1_CMD_AUTO_MSG        0xb
 #define EP1_CMD_DIMM_LEDS       0xc
+#define EP1_CMD_DIRECT_MON      0xe   /* setDirectMonitoringMode (NI kext) */
+#define EP1_CMD_GET_DIRECT_MON  0x12  /* getCurrentDirectMonitoringMode */
 
 #define EP1_BUFSIZE 64
 
@@ -84,5 +86,20 @@ int caiaq_set_audio_params(struct rk3_usb *u, int rate, int depth, int bpp);
 
 /* Compute bpp the way the Linux driver does (audio.c:266). */
 int caiaq_compute_bpp(int rate, int data_alignment, int n_streams);
+
+/*
+ * Hardware direct monitoring (RE'd from NI's NIUSBAudioDriver.kext).
+ * setDirectMonitoringMode sends EP1 cmd 0x0e with a single mode byte; the
+ * device routes its analog input to its analog output internally, bypassing
+ * the host round-trip (near-zero monitoring latency). The mode-byte semantics
+ * are not in the Linux driver — sweep them on hardware. Returns 0 on success.
+ */
+int caiaq_set_direct_mon(struct rk3_usb *u, uint8_t mode);
+
+/*
+ * Query the device's current direct-monitoring mode (EP1 cmd 0x12). Writes the
+ * mode byte from the reply into *mode_out. Returns 0 on success.
+ */
+int caiaq_get_direct_mon(struct rk3_usb *u, uint8_t *mode_out);
 
 #endif /* CAIAQ_PROTOCOL_H */
