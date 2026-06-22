@@ -197,8 +197,15 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
  * the round-trip is the isoc pipeline + safety offset, not this. Going lower
  * trades clicks for a couple ms (bad for guitar) and the real sub-30 ms lever is
  * a smaller isoc transfer — which storms the audio subsystem, so it is gated.
+ *
+ * 2026-06-22 — re-swept after OUT_FPX 32->16 halved the consumer bite (~96 frames
+ * now, not 384). 224 was stale (tuned at the old bite). Swept 192/176/160: 176 ran
+ * CLEAN (post-drain out_fill trough ~71-76, pb_underruns=0) and recovered ~1.9 ms
+ * (14.31 -> 12.38 ms loopback); 160 gave NO further fill reduction (the new consumer-
+ * bite floor), so 176 is the settled sweet spot with clear margin. Revert to 224 if
+ * a real DAW load ever underruns here.
  */
-#define RK3_OUT_FILL_SETPOINT 224
+#define RK3_OUT_FILL_SETPOINT 176
 
 /*
  * One-time startup drain target for the CAPTURE ring (frames). Capture is the
