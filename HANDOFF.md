@@ -10,7 +10,45 @@ Approach (user-confirmed): **userspace CoreAudio AudioServerPlugin (HAL plugin) 
 IOKit IOUSBLib**, NOT a DriverKit dext. Goal: full-duplex audio in+out.
 Plan file: `/Users/mihai/.claude/plans/this-folder-contains-the-jolly-beacon.md`
 
-## CURRENT TASK — MIDI without audio: SINGLE-OWNER engine (2026-06-21)
+## CURRENT TASK — ALWAYS-ON "CON" MIDI mode (2026-06-22)
+
+**Goal (user, 2026-06-22):** ship MIDI **on by default** — no UI, no checkbox, no
+`/tmp/rk3_midi_on` sentinel — and works regardless of audio. This mirrors NI's
+Controller-Editor "Start in MIDI mode" (`CON` on the display). Reverse-engineering
+the NI macOS driver + Controller Editor (notes in `/Users/mihai/DEV/caiaq/mac_drivers/
+FINDINGS.md`) confirmed there is **no device-side mode command to replicate**: NI's
+`NIHardwareAgent` daemon just owns the device, reads controls over the same caiaq EP1
+protocol, and publishes the CoreMIDI endpoints itself — exactly our engine+helper split.
+"CON" is only a cosmetic display the agent writes. So always-on = our engine arming the
+relay at open + writing "CON". Decisions (user): de-risk the read storm first;
+unconditional always-on (no override file); write "CON".
+
+**IMPLEMENTED + HW-VALIDATED (2026-06-22):** confirmed on hardware — MIDI works
+both with NO audio and alongside audio in Reaper; no storm/reboot across the
+session. Shipped.
+- `rk3_engine.c` — the MIDI relay now **arms unconditionally in the engine thread setup**
+  (right after `running` is set), so MIDI is live the moment USB is claimed at plugin
+  load. The `/tmp/rk3_midi_on` sentinel and `midi_sentinel_tick` are **removed**.
+- **Storm de-risk = THROTTLED re-arm (replaces the disable-latch).** `midi_arm_read`
+  stamps `midi_last_arm`; `midi_read_done` re-arms inline only if `>= RK3_MIDI_REARM_MIN_MS`
+  (1 ms) has elapsed, else defers via a one-shot `midi_rearm_timer` on the engine run
+  loop. This caps the EP 0x81 re-arm rate to ~1 kHz no matter how fast completions fire
+  (0-byte success / stall / immediate error), so a runaway physically can't peg the
+  CFRunLoop / storm coreaudiod. Real input (~100/s) clears the 1 ms floor every time →
+  re-arms inline, zero added latency. The old 256-cb/50 ms guard is kept only as a
+  rate-limited WARNING log (`RK3_MIDI_CB_WINDOW`/`WARN_MS`); it no longer disables.
+- **"CON" on the 4-digit display** via `midi_show_con` (one async `WRITE_IO` at relay
+  start): digit1=`C`(0x39) digit2=`O`(0x3F) digit3=`n`(0x54). Segment map confirmed
+  (bit6=g, from the centered-dash test in hardware-facts memory).
+- Helper (`rk3midihelper` + LaunchAgent) unchanged — still owns the "RigKontrol 3"
+  CoreMIDI source over loopback UDP :17890 (coreaudiod sandbox blocks `MIDIClientCreate`).
+
+**VALIDATED (2026-06-22):** installed, `CON` shows, buttons/pedal hit the "RigKontrol 3"
+CoreMIDI source with no audio AND alongside audio in Reaper; no storm/reboot.
+
+---
+
+## PRIOR TASK — MIDI without audio: SINGLE-OWNER engine (2026-06-21)
 
 **Goal (user, 2026-06-21):** make the foot-controls MIDI work **even when no audio is
 streaming** — not only while the audio driver streams. Buttons 1–9 → CC20–28 127/0 ch1;

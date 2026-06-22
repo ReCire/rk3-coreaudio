@@ -303,13 +303,19 @@ struct rk3_engine {
 	atomic_int midi_running;       /* gates the self-resubmitting EP1 read */
 	int        midi_send_errs;     /* relay send failures (logged, capped) */
 	uint8_t    midi_buf[512];      /* async bulk-read buffer for EP 0x81 */
-	unsigned   midi_cb_ctr;        /* completions since last rate check (storm guard) */
-	UInt64     midi_cb_t0;         /* mach time at last rate-check window start */
-	int        midi_storm_tripped; /* engine-thread only: 1 after the storm guard
-	                                * disabled the relay; the sentinel poller will
-	                                * not re-arm until the sentinel is removed and
-	                                * re-created (rm + touch), so a pathological
-	                                * device cannot be re-armed into a loop. */
+	unsigned   midi_cb_ctr;        /* completions since last rate-warn window */
+	UInt64     midi_cb_t0;         /* mach time at last rate-warn window start */
+	/*
+	 * Throttled re-arm (the storm de-risk; replaces the old disable-latch).
+	 * midi_arm_read stamps midi_last_arm; midi_read_done re-arms inline only if
+	 * >= RK3_MIDI_REARM_MIN_MS has elapsed, else it defers the re-arm to
+	 * midi_rearm_timer. This caps the EP 0x81 re-arm rate to <= ~1 kHz no matter
+	 * how fast completions fire (0-byte success, stall, immediate error), so a
+	 * runaway can never peg the run loop / storm coreaudiod — while real input
+	 * (~100/s, >=10 ms apart) always re-arms inline with zero added latency. */
+	UInt64            midi_last_arm;    /* mach time of the last ReadPipeAsync arm */
+	CFRunLoopTimerRef midi_rearm_timer; /* one-shot deferred re-arm (engine run loop) */
+	int        midi_storm_tripped; /* retained for telemetry; no longer latches off */
 
 	/*
 	 * LED / 7-segment listener (engine thread only). The engine binds a loopback
@@ -347,9 +353,8 @@ struct rk3_engine {
  * interface-handoff race entirely (there is never a second USB owner).
  *
  *   open        -> claim USB, run the EP1 handshake (device-info / bpp), start the
- *                  engine thread + run loop. The MIDI relay then arms itself when
- *                  the sentinel /tmp/rk3_midi_on is present (polled live). No audio
- *                  params are set and no isoc chains run yet.
+ *                  engine thread + run loop, and arm the foot-controls MIDI relay
+ *                  unconditionally (always-on; no audio params or isoc chains yet).
  *   audio_start -> set AUDIO_PARAMS, reset the rings, prime the isoc chains. Call
  *                  from CoreAudio StartIO.
  *   audio_stop  -> abort the isoc pipes; USB + the MIDI relay stay up. Call from

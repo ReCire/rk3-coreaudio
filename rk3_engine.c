@@ -378,6 +378,7 @@ static void engine_set_realtime(void)
 /* ---- MIDI relay: EP 0x81 control reports -> loopback UDP -> helper --- */
 
 static void midi_arm_read(struct rk3_engine *e);
+static void led_write_done(void *refcon, IOReturn result, void *arg0);
 
 /* Open a UDP socket connected to the helper's loopback port. Best-effort. */
 static void midi_relay_open(struct rk3_engine *e)
@@ -404,13 +405,30 @@ static void midi_relay_open(struct rk3_engine *e)
 }
 
 /*
- * Number of completions between rate checks, and the minimum time they must
- * span. Normal control traffic is ~100/s (AUTO_MSG analog interval + buttons on
- * change), so RK3_MIDI_CB_WINDOW completions should take seconds; anything that
- * does them in under RK3_MIDI_CB_MIN_MS is a tight re-arm loop, not real input.
+ * Storm de-risk. The relay is now always-on (no sentinel), so the old
+ * "disable + latch off" guard would have killed MIDI for the whole session with
+ * no way back. Instead we THROTTLE the re-arm: midi_arm_read stamps midi_last_arm
+ * and midi_read_done re-arms inline only when >= RK3_MIDI_REARM_MIN_MS has passed,
+ * otherwise it defers via midi_rearm_timer. This bounds the EP 0x81 re-arm rate to
+ * <= ~1 kHz regardless of how fast completions fire, so a runaway physically can't
+ * peg the CFRunLoop / storm coreaudiod. Real input (~100/s, >=10 ms apart) always
+ * clears the floor and re-arms inline => zero added latency. RK3_MIDI_CB_WINDOW is
+ * kept only for a rate-limited WARNING log (telemetry), it no longer disables.
  */
-#define RK3_MIDI_CB_WINDOW   256
-#define RK3_MIDI_CB_MIN_MS   50.0
+#define RK3_MIDI_REARM_MIN_MS  1.0
+#define RK3_MIDI_CB_WINDOW     1024
+#define RK3_MIDI_CB_WARN_MS    50.0
+
+/* Milliseconds elapsed since mach time t0 (0 if t0 is 0). */
+static double mach_ms_since(UInt64 t0)
+{
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0)
+		mach_timebase_info(&tb);
+	if (!t0)
+		return 1e9;
+	return (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e6;
+}
 
 /* Async completion for the EP 0x81 read: forward the report, then re-arm. */
 static void midi_read_done(void *refcon, IOReturn result, void *arg0)
@@ -449,52 +467,90 @@ static void midi_read_done(void *refcon, IOReturn result, void *arg0)
 	}
 
 	/*
-	 * STORM GUARD — DO NOT REMOVE. A self-resubmitting async read must be
-	 * protected against tight-looping: if a completion fires immediately and
-	 * repeatedly (an immediate error, a pipe stall, or a 0-byte success),
-	 * re-arming with no delay pegs this CFRunLoop thread and cascades coreaudiod
-	 * to a whole-machine 100% CPU storm (required a reboot, 2026-06-21). MIDI is
-	 * best-effort, so if completions outrun a sane control rate we DISABLE the
-	 * relay (logging the last result so we can see why) instead of re-arming.
-	 * This bounds any pathology to RK3_MIDI_CB_WINDOW cheap iterations.
+	 * Rate-limited WARNING only (telemetry) — the throttle below, not this, is
+	 * what bounds the load now. If a full window of completions arrives faster
+	 * than a sane control rate it means the device/pipe is misbehaving; log it
+	 * once per window so it's visible in driver-log, but keep relaying.
 	 */
 	if (++e->midi_cb_ctr >= RK3_MIDI_CB_WINDOW) {
-		static mach_timebase_info_data_t tb;
-		if (tb.denom == 0)
-			mach_timebase_info(&tb);
-		UInt64 now = mach_absolute_time();
-		double ms = e->midi_cb_t0
-			? (double)(now - e->midi_cb_t0) * tb.numer / tb.denom / 1e6
-			: 1e9;
-		if (ms < RK3_MIDI_CB_MIN_MS) {
-			ELOG("midi relay: completion storm (%d cbs in %.2f ms, last "
-			     "result=0x%08x) — DISABLING relay to protect audio",
-			     RK3_MIDI_CB_WINDOW, ms, result);
-			atomic_store_explicit(&e->midi_running, 0, memory_order_release);
-			e->midi_storm_tripped = 1;  /* latch: sentinel poller won't re-arm
-			                             * until the sentinel is rm'd + re-touched */
-			return;               /* no re-arm: relay stays off this session */
-		}
-		e->midi_cb_t0 = now;
+		double ms = mach_ms_since(e->midi_cb_t0);
+		if (ms < RK3_MIDI_CB_WARN_MS)
+			ELOG("midi relay: fast completions (%d cbs in %.2f ms, last "
+			     "result=0x%08x) — throttled to ~%g kHz, audio protected",
+			     RK3_MIDI_CB_WINDOW, ms, result, 1.0 / RK3_MIDI_REARM_MIN_MS);
+		e->midi_cb_t0 = mach_absolute_time();
 		e->midi_cb_ctr = 0;
 	}
 
-	/* Non-abort result within the sane rate: keep reading. */
-	midi_arm_read(e);
+	/*
+	 * THROTTLED RE-ARM (storm de-risk). Re-arm inline only if enough time has
+	 * passed since the last arm; otherwise defer to midi_rearm_timer so the run
+	 * loop can breathe. Caps the re-arm rate to ~1 kHz no matter how fast
+	 * completions fire, so a runaway can't peg the CFRunLoop. Real input clears
+	 * the floor every time, so it re-arms inline with no added latency.
+	 */
+	if (mach_ms_since(e->midi_last_arm) >= RK3_MIDI_REARM_MIN_MS) {
+		midi_arm_read(e);
+	} else if (e->midi_rearm_timer) {
+		double wait_ms = RK3_MIDI_REARM_MIN_MS - mach_ms_since(e->midi_last_arm);
+		if (wait_ms < 0)
+			wait_ms = 0;
+		CFRunLoopTimerSetNextFireDate(e->midi_rearm_timer,
+				CFAbsoluteTimeGetCurrent() + wait_ms / 1000.0);
+	}
 }
 
 static void midi_arm_read(struct rk3_engine *e)
 {
+	e->midi_last_arm = mach_absolute_time();
 	IOReturn kr = (*e->usb.intf)->ReadPipeAsync(e->usb.intf, e->usb.pipe_cmd_in,
 			e->midi_buf, sizeof(e->midi_buf), midi_read_done, e);
 	if (kr != kIOReturnSuccess)
 		ELOG("midi relay: ReadPipeAsync arm failed 0x%08x", kr);
 }
 
+/* Deferred re-arm: fires on the engine run loop after the throttle interval. */
+static void midi_rearm_tick(CFRunLoopTimerRef timer, void *info)
+{
+	(void)timer;
+	struct rk3_engine *e = info;
+	if (atomic_load_explicit(&e->midi_running, memory_order_acquire))
+		midi_arm_read(e);
+}
+
+/*
+ * Show "CON" on the 4-digit 7-segment display (cosmetic; mirrors NI's "MIDI
+ * mode" indicator). The RK3 LED/display is a control_state byte array sent via
+ * EP1_CMD_WRITE_IO: digit N = byte N, and within a digit bit0..6 = segments
+ * a,b,c,d,e,f,g (bit7 = decimal point). Confirmed bit6 = the middle bar (g).
+ *   'C' = a,d,e,f          = 0x39
+ *   'O' = a,b,c,d,e,f       = 0x3F
+ *   'n' = c,e,g             = 0x54
+ * Left-justified on digits 1-3; digit 4 + the LED bytes left dark. Async write
+ * on the engine run loop (same as led_recv); best-effort, never disturbs audio.
+ */
+static void midi_show_con(struct rk3_engine *e)
+{
+	if (e->led_busy)
+		return;                       /* a WRITE_IO is already in flight; skip */
+	e->led_wbuf[0] = EP1_CMD_WRITE_IO;
+	memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+	e->led_wbuf[1] = 0x39;            /* digit 1: C */
+	e->led_wbuf[2] = 0x3F;            /* digit 2: O */
+	e->led_wbuf[3] = 0x54;            /* digit 3: n */
+	e->led_busy = 1;
+	IOReturn kr = (*e->usb.intf)->WritePipeAsync(e->usb.intf, e->usb.pipe_cmd_out,
+			e->led_wbuf, (UInt32)EP1_BUFSIZE, led_write_done, e);
+	if (kr != kIOReturnSuccess) {
+		e->led_busy = 0;
+		ELOG("midi relay: CON display WritePipeAsync failed 0x%08x", kr);
+	}
+}
+
 /* Bring the relay up on the engine thread: open the socket, arm the EP1 read,
  * then tell the device to auto-report buttons/pedal. Arm BEFORE AUTO_MSG so we
- * never miss the first report. All steps are non-fatal to audio. The sentinel
- * policy (see midi_sentinel_tick) decides WHEN this runs; it just does the work. */
+ * never miss the first report. All steps are non-fatal to audio. Called
+ * unconditionally once at engine open (always-on MIDI; no opt-in sentinel). */
 static void midi_relay_start(struct rk3_engine *e)
 {
 	midi_relay_open(e);
@@ -508,6 +564,8 @@ static void midi_relay_start(struct rk3_engine *e)
 	uint8_t am[3] = { 1, 10, 0 };
 	if (caiaq_send_command(&e->usb, EP1_CMD_AUTO_MSG, am, sizeof(am)) != 0)
 		ELOG("midi relay: AUTO_MSG failed (controls won't auto-report)");
+
+	midi_show_con(e);                 /* light "CON" — MIDI is live */
 }
 
 static void midi_relay_stop(struct rk3_engine *e)
@@ -519,43 +577,6 @@ static void midi_relay_stop(struct rk3_engine *e)
 	if (e->midi_fd >= 0) {
 		close(e->midi_fd);
 		e->midi_fd = -1;
-	}
-}
-
-/*
- * Opt-in sentinel: the relay runs only while this file exists. The default-
- * installed driver is byte-for-byte the known-good audio path until the user
- * deliberately `touch`es it, and `rm`ing it disarms instantly — both WITHOUT a
- * reinstall, because we poll it live on the engine run loop (below) rather than
- * checking once at startup. coreaudiod (euid 202) can stat a file the user made
- * in /tmp. MIDI is independent of audio: the relay arms as soon as the sentinel
- * appears, whether or not anything is streaming.
- */
-#define RK3_MIDI_SENTINEL "/tmp/rk3_midi_on"
-
-/*
- * Poll the sentinel ~1 Hz on the engine run loop and toggle the relay to match.
- * Runs on the engine thread (same thread as midi_read_done), so midi_storm_tripped
- * and the relay calls need no locking. The storm latch is cleared only when the
- * sentinel is absent, so after a storm trip the user must rm + re-touch to re-arm
- * (a pathological device cannot loop the relay back on every second).
- */
-static void midi_sentinel_tick(CFRunLoopTimerRef timer, void *info)
-{
-	(void)timer;
-	struct rk3_engine *e = info;
-	if (!atomic_load_explicit(&e->running, memory_order_acquire))
-		return;
-	int want = (access(RK3_MIDI_SENTINEL, F_OK) == 0);
-	int on   = atomic_load_explicit(&e->midi_running, memory_order_acquire);
-
-	if (!want) {
-		if (on)
-			midi_relay_stop(e);
-		e->midi_storm_tripped = 0;     /* sentinel gone: allow a future re-arm */
-	} else if (!on && !e->midi_storm_tripped) {
-		ELOG("midi relay: %s present — arming foot-controls relay", RK3_MIDI_SENTINEL);
-		midi_relay_start(e);
 	}
 }
 
@@ -699,34 +720,41 @@ static void *engine_thread(void *arg)
 	}
 	CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
 
-	/* Poll the MIDI sentinel ~1 Hz so `touch`/`rm` arm/disarm the relay live,
-	 * independent of audio. The relay itself runs on this same run loop. */
+	/* One-shot timer used by the throttled re-arm: it never fires on its own
+	 * (seeded far in the future), midi_read_done bumps its fire date when it has
+	 * to defer a re-arm. Created here so it lives on this run loop. */
 	CFRunLoopTimerContext tctx = { 0, e, NULL, NULL, NULL };
-	CFRunLoopTimerRef midi_timer = CFRunLoopTimerCreate(NULL,
-			CFAbsoluteTimeGetCurrent() + 1.0, 1.0, 0, 0,
-			midi_sentinel_tick, &tctx);
-	if (midi_timer)
-		CFRunLoopAddTimer(CFRunLoopGetCurrent(), midi_timer, kCFRunLoopDefaultMode);
+	e->midi_rearm_timer = CFRunLoopTimerCreate(NULL,
+			CFAbsoluteTimeGetCurrent() + 1e9, 1e9, 0, 0,
+			midi_rearm_tick, &tctx);
+	if (e->midi_rearm_timer)
+		CFRunLoopAddTimer(CFRunLoopGetCurrent(), e->midi_rearm_timer,
+				kCFRunLoopDefaultMode);
 
 	/* LED / 7-segment control listener. Passive (acts only on inbound datagrams),
-	 * no callback-rate risk, so it runs unconditionally — no opt-in sentinel. */
+	 * no callback-rate risk, so it runs unconditionally. */
 	led_listen_start(e);
 
 	atomic_store_explicit(&e->running, 1, memory_order_release);
 	e->start_rc = 0;
 	atomic_store_explicit(&e->thread_ready, 1, memory_order_release);
 
-	ELOG("engine USB up (rate=%d bpp=%d) — MIDI relay follows %s; audio idle",
-	     e->rate, e->bpp, RK3_MIDI_SENTINEL);
+	/* Always-on MIDI: arm the foot-controls relay the moment USB is claimed, so
+	 * the RK3 is a system MIDI device whether or not audio is streaming. */
+	midi_relay_start(e);
+
+	ELOG("engine USB up (rate=%d bpp=%d) — MIDI relay armed (always-on); audio idle",
+	     e->rate, e->bpp);
 	CFRunLoopRun();   /* until rk3_engine_close() calls CFRunLoopStop */
 
 	/* teardown on the engine thread (audio already stopped by close) */
 	led_listen_stop(e);
 	midi_relay_stop(e);
-	if (midi_timer) {
-		CFRunLoopRemoveTimer(CFRunLoopGetCurrent(), midi_timer,
+	if (e->midi_rearm_timer) {
+		CFRunLoopRemoveTimer(CFRunLoopGetCurrent(), e->midi_rearm_timer,
 				     kCFRunLoopDefaultMode);
-		CFRelease(midi_timer);
+		CFRelease(e->midi_rearm_timer);
+		e->midi_rearm_timer = NULL;
 	}
 	(*e->usb.intf)->AbortPipe(e->usb.intf, e->usb.pipe_iso_in);
 	(*e->usb.intf)->AbortPipe(e->usb.intf, e->usb.pipe_iso_out);
