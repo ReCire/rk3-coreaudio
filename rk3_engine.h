@@ -416,6 +416,12 @@ struct rk3_engine {
 	 */
 	uint8_t            led_wbuf[EP1_BUFSIZE];
 	int                led_busy;
+
+	/* Cosmetic power-on display sequence (engine run loop): a segment-sweep
+	 * animation, then a brief sample-rate flash, then it settles on "Con".
+	 * Stepped by boot_anim_tick off boot_timer; self-invalidates when done. */
+	CFRunLoopTimerRef  boot_timer;
+	int                boot_step;
 };
 
 /*

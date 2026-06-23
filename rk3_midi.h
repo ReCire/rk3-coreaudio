@@ -15,10 +15,9 @@
  *
  * Default mapping (edit the tables in rk3_midi.c):
  *   button 1..9  -> CC 20..28, value 127 on press / 0 on release, channel 1
- *   pedal axis0  -> CC 11 (expression),         0..127, channel 1
- *   pedal axis1  -> CC 12, axis2 -> CC 13       (axis the pedal lives on is
- *                                                hardware-dependent; the tool
- *                                                prints raw axes so you can see)
+ *   axis2 (built-in treadle) -> CC 11 (expression), 0..127, channel 1
+ *   axis0 / axis1 (rear EXP pedal jacks) -> CC 12 / CC 13, 0..127, channel 1
+ *   (run the tool/helper with -v to print raw axes for calibration)
  */
 
 #ifndef RK3_MIDI_H
@@ -57,7 +56,20 @@ struct rk3_midi;
  */
 struct rk3_midi *rk3_midi_open(const char *name);
 
-/* Tear down the virtual source and client. Safe on NULL. */
+/*
+ * Also publish a virtual *destination* named `dest_name` that the DAW can send
+ * MIDI Beat Clock to, and blink the RK3 display's decimal point on every beat.
+ * Counts 0xF8 clock pulses (24 per quarter note), aligns the downbeat on
+ * Start/Continue (0xFA/0xFB), clears the dot on Stop (0xFC). The beat flash is
+ * authored as a "Con." control_state and sent to the audio engine over loopback
+ * UDP (RK3_LED_UDP_PORT) — the engine owns USB and relays it to WRITE_IO.
+ *
+ * Optional; only the installed helper needs it (the standalone tool drives the
+ * device directly). Returns 0 on success, -1 if the destination can't be made.
+ */
+int rk3_midi_enable_clock_sync(struct rk3_midi *m, const char *dest_name);
+
+/* Tear down the virtual source/destination and client. Safe on NULL. */
 void rk3_midi_close(struct rk3_midi *m);
 
 /*

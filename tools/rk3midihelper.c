@@ -43,6 +43,12 @@ int main(int argc, char **argv)
 	if (!m)
 		return 1;
 
+	/* Publish a destination too: clock it from the DAW to blink the display's
+	 * decimal point on the beat. Non-fatal — controls/MIDI still work without it. */
+	if (rk3_midi_enable_clock_sync(m, "RigKontrol 3") != 0)
+		fprintf(stderr, "warning: clock-sync destination unavailable; "
+				"tempo flash disabled\n");
+
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0) {
 		perror("socket");
@@ -75,8 +81,10 @@ int main(int argc, char **argv)
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
-	printf("RigKontrol 3 MIDI helper: CoreMIDI source up; "
-	       "listening on udp 127.0.0.1:%d. Play audio + use the controls.\n",
+	printf("RigKontrol 3 MIDI helper: CoreMIDI source + clock destination up; "
+	       "listening on udp 127.0.0.1:%d. Play audio + use the controls.\n"
+	       "Send MIDI Beat Clock to the 'RigKontrol 3' output to flash the "
+	       "display on the beat.\n",
 	       RK3_MIDI_UDP_PORT);
 	fflush(stdout);
 

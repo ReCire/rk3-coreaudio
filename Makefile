@@ -25,7 +25,7 @@ ENGINE_SRC := usb_iokit.c caiaq_protocol.c codec_mode2.c rk3_engine.c
         sandboxprobe install-probe uninstall-probe probe-log \
         midiprobe install-midi-probe uninstall-midi-probe midi-probe-log \
         driver install-driver uninstall-driver driver-log rk3midi rk3led \
-        rk3monitor \
+        rk3monitor install uninstall \
         midihelper install-midihelper uninstall-midihelper midihelper-log
 
 all: usbprobe handshake codectest stream epdump
@@ -98,16 +98,26 @@ $(BUILD)/rk3midihelper: tools/rk3midihelper.c rk3_midi.c \
 		$(FRAMEWORKS) -framework CoreMIDI -o $@
 	@echo "Built $@ — run ./build/rk3midihelper while the RK3 audio driver streams."
 
+# A LaunchAgent must be (un)loaded in the invoking user's GUI domain, NOT the
+# root/system domain. If this target is run under sudo, launchctl run as root
+# would target the wrong domain ("Load failed: 5") — so resolve the real user's
+# uid via $SUDO_UID (set under sudo) and fall back to id -u, and use the modern
+# bootstrap/bootout which take an explicit gui/<uid> domain. The plist is also
+# chowned back to that user so a sudo run doesn't leave it root-owned.
 install-midihelper: $(BUILD)/rk3midihelper
 	sudo cp $(BUILD)/rk3midihelper /usr/local/bin/rk3midihelper
 	mkdir -p $(HOME)/Library/LaunchAgents
 	cp $(HELPER_PLIST) $(HELPER_AGENT)
-	launchctl unload $(HELPER_AGENT) 2>/dev/null || true
-	launchctl load -w $(HELPER_AGENT)
-	@echo "Loaded LaunchAgent. 'RigKontrol 3' MIDI source should now be present."
+	@uid=$${SUDO_UID:-$$(id -u)}; gid=$${SUDO_GID:-$$(id -g)}; \
+	chown $$uid:$$gid $(HELPER_AGENT); \
+	launchctl bootout gui/$$uid $(HELPER_AGENT) 2>/dev/null || true; \
+	launchctl bootstrap gui/$$uid $(HELPER_AGENT) && \
+	  echo "Loaded LaunchAgent in gui/$$uid. 'RigKontrol 3' MIDI source should now be present." || \
+	  echo "launchctl bootstrap failed; run WITHOUT sudo: make install-midihelper"
 
 uninstall-midihelper:
-	launchctl unload $(HELPER_AGENT) 2>/dev/null || true
+	@uid=$${SUDO_UID:-$$(id -u)}; \
+	launchctl bootout gui/$$uid $(HELPER_AGENT) 2>/dev/null || true
 	rm -f $(HELPER_AGENT)
 	sudo rm -f /usr/local/bin/rk3midihelper
 	@echo "Uninstalled MIDI helper."
@@ -224,6 +234,15 @@ uninstall-driver:
 	sudo rm -rf $(HAL_DIR)/RigKontrol3.driver
 	sudo killall coreaudiod || true
 	@echo "Uninstalled."
+
+# Convenience: build + install BOTH components (audio driver + MIDI helper).
+# Helper first, so the coreaudiod restart in install-driver happens last. Works
+# with or without a sudo prefix (both sub-targets resolve the user domain).
+install: install-midihelper install-driver
+	@echo "Driver + MIDI helper installed."
+
+uninstall: uninstall-midihelper uninstall-driver
+	@echo "Driver + MIDI helper removed."
 
 driver-log:
 	log show --last 3m --predicate 'subsystem == "com.mihai.rk3"' --info --debug

@@ -627,27 +627,103 @@ static void midi_rearm_tick(CFRunLoopTimerRef timer, void *info)
  * EP1_CMD_WRITE_IO: digit N = byte N, and within a digit bit0..6 = segments
  * a,b,c,d,e,f,g (bit7 = decimal point). Confirmed bit6 = the middle bar (g).
  *   'C' = a,d,e,f          = 0x39
- *   'O' = a,b,c,d,e,f       = 0x3F
+ *   'o' = c,d,e,g           = 0x5C
  *   'n' = c,e,g             = 0x54
  * Left-justified on digits 1-3; digit 4 + the LED bytes left dark. Async write
  * on the engine run loop (same as led_recv); best-effort, never disturbs audio.
  */
-static void midi_show_con(struct rk3_engine *e)
+/* 7-seg glyphs for 0-9 (segments a..g = bits 0..6; bit7 = decimal point). */
+static const uint8_t kSegDigit[10] = {
+	0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F,
+};
+
+/* Issue the current e->led_wbuf payload (digits/LEDs in bytes 1..) as an async
+ * WRITE_IO. Best-effort: skipped if a prior write is still in flight. Shared by
+ * the boot animation and midi_show_con; the caller fills bytes 1.. first. */
+static void led_write_frame(struct rk3_engine *e)
 {
 	if (e->led_busy)
 		return;                       /* a WRITE_IO is already in flight; skip */
 	e->led_wbuf[0] = EP1_CMD_WRITE_IO;
-	memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
-	e->led_wbuf[1] = 0x39;            /* digit 1: C */
-	e->led_wbuf[2] = 0x3F;            /* digit 2: O */
-	e->led_wbuf[3] = 0x54;            /* digit 3: n */
 	e->led_busy = 1;
 	IOReturn kr = (*e->usb.intf)->WritePipeAsync(e->usb.intf, e->usb.pipe_cmd_out,
 			e->led_wbuf, (UInt32)EP1_BUFSIZE, led_write_done, e);
 	if (kr != kIOReturnSuccess) {
 		e->led_busy = 0;
-		ELOG("midi relay: CON display WritePipeAsync failed 0x%08x", kr);
+		ELOG("led: display WRITE_IO WritePipeAsync failed 0x%08x", kr);
 	}
+}
+
+static void midi_show_con(struct rk3_engine *e)
+{
+	memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+	e->led_wbuf[1] = 0x39;            /* digit 1: C */
+	e->led_wbuf[2] = 0x5C;            /* digit 2: o */
+	e->led_wbuf[3] = 0x54;            /* digit 3: n */
+	led_write_frame(e);
+}
+
+/* Render the live sample rate in kHz (44/48/96/192) left-justified on the
+ * 7-seg display: most-significant digit on the leftmost digit. */
+static void boot_set_rate(struct rk3_engine *e)
+{
+	memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+	int khz = e->rate / 1000;         /* 44, 48, 96, 192 */
+	if (khz <= 0)
+		khz = 48;
+	uint8_t digs[4];
+	int n = 0;
+	while (khz > 0 && n < 4) { digs[n++] = (uint8_t)(khz % 10); khz /= 10; }
+	for (int i = 0; i < n; i++)        /* digs is LSB-first; reverse onto digits */
+		e->led_wbuf[1 + i] = kSegDigit[digs[n - 1 - i]];
+}
+
+/*
+ * Power-on display sequence, stepped once per boot_timer tick (~90 ms) on the
+ * engine run loop: the sample rate flashes twice, then it settles on "Con" and
+ * the timer self-invalidates. Purely cosmetic and best-effort (uses the same
+ * drop-if-busy WRITE_IO path), so it never touches the audio path.
+ */
+static void boot_anim_tick(CFRunLoopTimerRef t, void *info)
+{
+	(void)t;
+	struct rk3_engine *e = info;
+	int s = e->boot_step++;
+
+	switch (s) {
+	case 0:                                            /* rate on */
+	case 2:
+		boot_set_rate(e);
+		led_write_frame(e);
+		break;
+	case 1:                                            /* blank (blink) */
+		memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+		led_write_frame(e);
+		break;
+	default:                                           /* settle + stop */
+		midi_show_con(e);
+		if (e->boot_timer) {
+			CFRunLoopTimerInvalidate(e->boot_timer);
+			CFRelease(e->boot_timer);
+			e->boot_timer = NULL;
+		}
+		break;
+	}
+}
+
+static void boot_anim_start(struct rk3_engine *e)
+{
+	e->boot_step = 0;
+	CFRunLoopTimerContext tctx = { 0, e, NULL, NULL, NULL };
+	e->boot_timer = CFRunLoopTimerCreate(NULL,
+			CFAbsoluteTimeGetCurrent(),   /* first frame immediately */
+			0.09,                          /* ~90 ms per frame */
+			0, 0, boot_anim_tick, &tctx);
+	if (e->boot_timer)
+		CFRunLoopAddTimer(CFRunLoopGetCurrent(), e->boot_timer,
+				  kCFRunLoopDefaultMode);
+	else
+		midi_show_con(e);                 /* no timer: just show Con */
 }
 
 /* Bring the relay up on the engine thread: open the socket, arm the EP1 read,
@@ -668,7 +744,7 @@ static void midi_relay_start(struct rk3_engine *e)
 	if (caiaq_send_command(&e->usb, EP1_CMD_AUTO_MSG, am, sizeof(am)) != 0)
 		ELOG("midi relay: AUTO_MSG failed (controls won't auto-report)");
 
-	midi_show_con(e);                 /* light "CON" — MIDI is live */
+	boot_anim_start(e);               /* sweep + rate flash, settling on "Con" */
 }
 
 static void midi_relay_stop(struct rk3_engine *e)
@@ -853,6 +929,11 @@ static void *engine_thread(void *arg)
 	/* teardown on the engine thread (audio already stopped by close) */
 	led_listen_stop(e);
 	midi_relay_stop(e);
+	if (e->boot_timer) {              /* boot animation still running at close */
+		CFRunLoopTimerInvalidate(e->boot_timer);
+		CFRelease(e->boot_timer);
+		e->boot_timer = NULL;
+	}
 	if (e->midi_rearm_timer) {
 		CFRunLoopRemoveTimer(CFRunLoopGetCurrent(), e->midi_rearm_timer,
 				     kCFRunLoopDefaultMode);
@@ -996,6 +1077,8 @@ int rk3_engine_open(struct rk3_engine *e, int rate)
 	e->led_writes = 0;
 	e->led_errs = 0;
 	e->led_busy = 0;
+	e->boot_timer = NULL;
+	e->boot_step = 0;
 
 	if (rk3_usb_open(&e->usb) != 0)
 		return -1;
@@ -1235,8 +1318,13 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 
 	int i = 0;
 	for (; i < got / RK3_BYTES_PER_FRAME; i++) {
-		dst[i * 2 + 0] = s24be_to_f32(&e->cap_buf[r]); r = (r + 3) % RK3_RING_BYTES;
-		dst[i * 2 + 1] = s24be_to_f32(&e->cap_buf[r]); r = (r + 3) % RK3_RING_BYTES;
+		/* The RK3 streams its two capture channels in the opposite order to
+		 * its silkscreened input jacks, so swap them here: device sample 0 ->
+		 * Reaper input 2, device sample 1 -> Reaper input 1. */
+		float c0 = s24be_to_f32(&e->cap_buf[r]); r = (r + 3) % RK3_RING_BYTES;
+		float c1 = s24be_to_f32(&e->cap_buf[r]); r = (r + 3) % RK3_RING_BYTES;
+		dst[i * 2 + 0] = c1;
+		dst[i * 2 + 1] = c0;
 	}
 	atomic_store_explicit(&e->cap_r, r, memory_order_release);
 	for (; i < nframes; i++) {          /* zero-fill underrun */

@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & package release
+    runs-on: macos-14   # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build driver + helper
+        run: |
+          make test
+          make driver
+          make midihelper
+
+      - name: Assemble release bundle
+        run: |
+          STAGE=rk3-coreaudio-macos
+          mkdir -p "$STAGE"
+          cp -R build/RigKontrol3.driver "$STAGE/"
+          cp build/rk3midihelper "$STAGE/"
+          cp launchd/com.mihai.rk3.midihelper.plist "$STAGE/"
+          cp install.sh uninstall.sh README.md LICENSE "$STAGE/"
+          chmod +x "$STAGE/install.sh" "$STAGE/uninstall.sh"
+          # ditto preserves the .driver bundle structure + code signature.
+          ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$STAGE.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rk3-coreaudio-macos.zip
+          generate_release_notes: true
