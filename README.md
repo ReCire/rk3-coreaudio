@@ -19,7 +19,8 @@ What you get:
 - **MIDI foot controls** — the 9 foot buttons and the pedals are published as a
   CoreMIDI source named **"RigKontrol 3"** (buttons → CC20–28; built-in treadle →
   CC11; the two rear expression-pedal jacks → CC12 / CC13). Always on; works with
-  or without audio streaming. The display shows `Con`.
+  or without audio streaming. The display shows `Con`. The mapping is
+  **configurable** without a UI — see *MIDI mapping config* below.
 - **Tempo flash** — the helper also exposes a CoreMIDI *destination* named
   **"RigKontrol 3"**. Send it MIDI Beat Clock from your DAW and the display's
   decimal point blinks on the beat (`Con` → `Con.`), aligned to the transport's
@@ -93,6 +94,40 @@ Useful targets (see the `Makefile` for the full list):
 | `make all` | build the hardware probe/diagnostic tools |
 | `make iotest` | build the loopback audio test tool |
 | `make test` | run the codec unit test (no hardware) |
+
+## MIDI mapping config
+
+The built-in mapping (buttons → CC20–28, treadle → CC11, rear jacks → CC12/13,
+all momentary) works out of the box. To change it, drop a config file at
+`~/.config/rk3/midi.conf` — the helper reads it at startup and again whenever you
+run `rk3-reload-config`, so edits apply live without a restart:
+
+```sh
+mkdir -p ~/.config/rk3
+cp docs/midi.conf.example ~/.config/rk3/midi.conf
+$EDITOR ~/.config/rk3/midi.conf
+rk3-reload-config
+```
+
+A missing file is fine — everything falls back to the built-in default, and bad
+lines are logged (`make midihelper-log`) and skipped. The file lets you set:
+
+- **Output channel** (`channel 1..16`).
+- **Per-button behaviour** by the *printed* P1..P9 label (firmware bit-scramble is
+  handled for you): `momentary` (default), `toggle` (press flips a latch),
+  `hold` (momentary CC plus a second CC when held past `time` ms), `tap` (quick
+  tap vs hold fire different CCs, mutually exclusive), or `off`.
+- **Per-pedal mapping** for `treadle` / `exp1` / `exp2`: continuous `cc`, raw-ADC
+  `calibMin`/`calibMax`, and an optional derived on/off `switch` CC with
+  `son`/`soff` hysteresis thresholds.
+
+Calibrate a pedal's travel with `rk3-calibrate <1|2|3>` (1 = treadle, 2 = EXP1,
+3 = EXP2): it asks the running helper to capture the raw min/max while you sweep
+the pedal, then writes `calibMin`/`calibMax` into the config and applies them
+live. See `docs/midi.conf.example` for the full annotated syntax.
+
+(`rk3-reload-config` and `rk3-calibrate` are installed to `/usr/local/bin` by
+`make install-midihelper`.)
 
 ### Why the in-place re-sign matters
 

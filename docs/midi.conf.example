@@ -1,0 +1,66 @@
+# RigKontrol 3 — MIDI mapping config
+#
+# Copy to ~/.config/rk3/midi.conf to override the built-in defaults. The helper
+# (rk3midihelper / the standalone rk3midi tool) reads it at startup, and again
+# whenever you run `rk3-reload-config` (which sends it SIGHUP) — so edits apply
+# live, no restart:
+#
+#   mkdir -p ~/.config/rk3
+#   cp docs/midi.conf.example ~/.config/rk3/midi.conf
+#   $EDITOR ~/.config/rk3/midi.conf
+#   rk3-reload-config
+#
+# A missing file is fine — everything below shows the built-in default, so an
+# unedited copy changes nothing. Bad lines are logged and skipped (that one
+# setting keeps its default). '#' starts a comment; tokens are separated by
+# whitespace and/or '='. Set RK3_MIDI_CONFIG to point at a different file.
+
+# MIDI output channel for every control, 1..16.
+channel = 1
+
+# ---- Foot buttons (P1..P9 by the PRINTED label; the scrambled firmware bit
+#      order is handled for you) --------------------------------------------
+#
+# An optional mode keyword sets the behaviour (default = momentary):
+#   momentary   press -> 127, release -> 0                    (the default)
+#   toggle      each press flips a latch 127 <-> 0; release ignored
+#   hold        momentary on `cc`, PLUS `long` fires when held past `time` ms
+#   tap         tap vs hold, mutually exclusive: a quick press pulses `cc`,
+#               holding past `time` ms pulses `long` instead (release-triggered,
+#               so a tap feels instant — only a hold waits out the threshold)
+#   off         disable the button entirely
+#
+# Params: `cc N` primary CC, `long N` secondary CC (hold/tap), `time MS` the
+# long-press threshold (default 350 ms). A "pulse" is 127 immediately then 0.
+button 1 = cc 20
+button 2 = cc 21
+button 3 = cc 22
+button 4 = cc 23
+button 5 = cc 24
+button 6 = cc 25
+button 7 = cc 26
+button 8 = cc 27
+button 9 = cc 28
+# Examples:
+# button 1 = toggle cc 20                 # press to turn on, press again off
+# button 2 = hold cc 21 long 30 time 400  # CC21 momentary; +CC30 if held >400ms
+# button 3 = tap  cc 22 long 31 time 350  # tap=CC22, hold=CC31 (one or the other)
+
+# ---- Expression pedals -----------------------------------------------------
+#
+#   treadle      the built-in foot treadle
+#   exp1 / exp2  the two rear external pedal jacks
+#
+#   cc N                 continuous CC, 0..127  (or `off` for no continuous CC)
+#   calibMin/calibMax    raw ADC readings (rest..full) that map to CC 0..127.
+#                        Set these with `rk3-calibrate 1|2|3` (1=treadle,
+#                        2=EXP1, 3=EXP2) — it sweeps + writes them for you.
+#   switch N             ALSO emit a derived on/off CC N from the pedal value:
+#                        127 when value >= son, 0 when value < soff. The son/soff
+#                        gap is hysteresis so it doesn't chatter at the edge.
+#   son V / soff V       switch on/off thresholds in 0..127 (default 5 / 3)
+pedal treadle = cc 11 calibMin 40 calibMax 270
+pedal exp1    = cc 12 calibMin 0  calibMax 1023
+pedal exp2    = cc 13 calibMin 0  calibMax 1023
+# Example — treadle sweeps CC11 AND turns CC9 on once you push off the heel:
+# pedal treadle = cc 11 calibMin 40 calibMax 270 switch 9 son 5 soff 3

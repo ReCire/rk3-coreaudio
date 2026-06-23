@@ -62,6 +62,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Apply ~/.config/rk3/midi.conf if present (overrides built-in defaults). */
+	rk3_midi_load_config(m, NULL);
+
 	if (set_auto_msg(&u, 1, 10, 0) != 0)
 		fprintf(stderr, "warning: AUTO_MSG command failed\n");
 
@@ -70,18 +73,18 @@ int main(int argc, char **argv)
 	printf("Publishing CoreMIDI source \"RigKontrol 3\". "
 	       "Press buttons / move pedal. Ctrl-C to quit.\n");
 
-	/* Poll EP1 IN. Short timeout so SIGINT is responsive; timeouts are normal
-	 * (the device only sends on change / at the auto-report interval). */
+	/* Poll EP1 IN. Short timeout so SIGINT stays responsive and the HOLD/TAP
+	 * timers tick promptly; timeouts are normal (the device only sends on
+	 * change / at the auto-report interval). */
 	while (!g_stop) {
 		uint8_t buf[EP1_BUFSIZE];
 		size_t len = sizeof(buf);
-		int rc = rk3_bulk_read(&u, buf, &len, 100);
-		if (rc == RK3_ETIMEOUT)
-			continue;
-		if (rc != 0)
-			break;
-		if (len >= 1)
+		int rc = rk3_bulk_read(&u, buf, &len, 15);
+		if (rc == 0 && len >= 1)
 			rk3_midi_dispatch(m, buf, (int)len, verbose);
+		else if (rc != 0 && rc != RK3_ETIMEOUT)
+			break;
+		rk3_midi_tick(m, verbose);   /* fire long-press actions */
 	}
 
 	printf("\nshutting down\n");

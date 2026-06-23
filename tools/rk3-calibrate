@@ -1,0 +1,46 @@
+#!/bin/bash
+#
+# rk3-calibrate <1|2|3> — calibrate a RigKontrol 3 expression pedal's range.
+#
+#   1 = built-in treadle      (axis 2)
+#   2 = rear EXP1 pedal jack   (axis 0)
+#   3 = rear EXP2 pedal jack   (axis 1)
+#
+# Asks the running MIDI helper to capture the raw ADC min/max while you sweep
+# the pedal, then it writes calibMin/calibMax into ~/.config/rk3/midi.conf and
+# applies them live. The audio driver need NOT be streaming — the helper gets
+# the pedal reports as long as the device is connected and the helper is up.
+#
+# Requires bash (uses /dev/udp). The helper must be running (make install-midihelper).
+
+case "$1" in
+	1) axis=2; name="built-in treadle";;
+	2) axis=0; name="rear EXP1 jack";;
+	3) axis=1; name="rear EXP2 jack";;
+	*) echo "usage: $(basename "$0") <1|2|3>   (1=treadle, 2=EXP1, 3=EXP2)" >&2
+	   exit 1;;
+esac
+
+port=17892
+log=/tmp/rk3midihelper.log
+
+echo "Calibrating pedal $1 ($name)."
+echo "Get ready to sweep it slowly heel<->toe through its FULL travel."
+echo "Capture starts in 2 seconds and lasts ~6 seconds."
+sleep 2
+
+if ! printf 'CAL %d' "$axis" > "/dev/udp/127.0.0.1/$port" 2>/dev/null; then
+	echo "Could not send to the helper on udp:$port." >&2
+	echo "Is the MIDI helper running?  (make install-midihelper)" >&2
+	exit 1
+fi
+
+echo ">>> SWEEP THE PEDAL NOW (full range, a few times) <<<"
+sleep 7
+
+echo
+echo "Done — calibMin/calibMax written to ~/.config/rk3/midi.conf and applied live."
+if [ -f "$log" ]; then
+	echo "Captured values:"
+	grep "calibrated" "$log" | tail -n 1 || true
+fi

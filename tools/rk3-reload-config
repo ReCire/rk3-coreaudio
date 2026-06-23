@@ -1,0 +1,18 @@
+#!/bin/bash
+#
+# rk3-reload-config — re-apply ~/.config/rk3/midi.conf without restarting the
+# RigKontrol 3 MIDI helper. Sends SIGHUP; the helper re-reads the config live
+# (button modes, CC mappings, pedal calibration), so edits take effect at once.
+#
+# Usage: rk3-reload-config
+
+label="com.mihai.rk3.midihelper"
+
+if launchctl kill HUP "gui/$(id -u)/$label" 2>/dev/null; then
+	echo "Config reload signalled (SIGHUP) to $label."
+elif pkill -HUP -x rk3midihelper; then
+	echo "Config reload signalled (SIGHUP) to rk3midihelper."
+else
+	echo "RigKontrol 3 MIDI helper does not appear to be running." >&2
+	exit 1
+fi

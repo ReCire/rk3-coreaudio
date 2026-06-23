@@ -106,6 +106,8 @@ $(BUILD)/rk3midihelper: tools/rk3midihelper.c rk3_midi.c \
 # chowned back to that user so a sudo run doesn't leave it root-owned.
 install-midihelper: $(BUILD)/rk3midihelper
 	sudo cp $(BUILD)/rk3midihelper /usr/local/bin/rk3midihelper
+	sudo cp tools/rk3-reload-config tools/rk3-calibrate /usr/local/bin/
+	sudo chmod +x /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate
 	mkdir -p $(HOME)/Library/LaunchAgents
 	cp $(HELPER_PLIST) $(HELPER_AGENT)
 	@uid=$${SUDO_UID:-$$(id -u)}; gid=$${SUDO_GID:-$$(id -g)}; \
@@ -120,6 +122,7 @@ uninstall-midihelper:
 	launchctl bootout gui/$$uid $(HELPER_AGENT) 2>/dev/null || true
 	rm -f $(HELPER_AGENT)
 	sudo rm -f /usr/local/bin/rk3midihelper
+	sudo rm -f /usr/local/bin/rk3-reload-config /usr/local/bin/rk3-calibrate
 	@echo "Uninstalled MIDI helper."
 
 midihelper-log:

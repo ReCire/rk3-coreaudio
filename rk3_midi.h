@@ -48,6 +48,14 @@
  */
 #define RK3_LED_UDP_PORT 17891
 
+/*
+ * Loopback UDP control port the MIDI helper listens on for calibration requests
+ * (from tools/rk3-calibrate). A datagram "CAL <axis>" (axis 0=exp1, 1=exp2,
+ * 2=treadle) starts a raw min/max capture window; the helper applies + persists
+ * the result to the config file. Normal-user helper only — not coreaudiod.
+ */
+#define RK3_CTL_UDP_PORT 17892
+
 struct rk3_midi;
 
 /*
@@ -55,6 +63,56 @@ struct rk3_midi;
  * "RigKontrol 3"). Returns NULL on failure (message to stderr).
  */
 struct rk3_midi *rk3_midi_open(const char *name);
+
+/*
+ * Override the built-in default mapping from a config file: MIDI channel,
+ * per-button CC numbers (addressed by physical label P1..P9), per-axis CC
+ * numbers, and per-axis raw-ADC calibration (calibMin/calibMax -> 0..127).
+ *
+ * `path` NULL means $RK3_MIDI_CONFIG, else ~/.config/rk3/midi.conf. A missing
+ * file is NOT an error — the built-in defaults are kept. Bad lines are logged
+ * to stderr and skipped (those settings keep their default); only the offending
+ * setting is dropped, the rest of the file still applies.
+ *
+ * Call once after rk3_midi_open(), before dispatching. Returns 0 if the file
+ * was absent or applied cleanly, 1 if any line/value was rejected, -1 on a
+ * fatal argument error.
+ *
+ * Format (whitespace- or '='-separated, '#' starts a comment):
+ *   channel = 1                                  # 1..16
+ *
+ *   # buttons, by printed label P1..P9. Mode keyword optional (default momentary):
+ *   button 1 = cc 20                             # momentary: press 127 / rel 0
+ *   button 2 = toggle cc 21                      # latch: press flips 127<->0
+ *   button 3 = hold cc 22 long 23 time 350       # +CC23 when held >350ms
+ *   button 4 = tap  cc 24 long 25 time 350       # tap=CC24, hold=CC25 (exclusive)
+ *   button 5 = off                               # disable a button
+ *
+ *   # pedals: continuous cc + raw calibration; optional derived on/off switch.
+ *   pedal treadle = cc 11 calibMin 40 calibMax 270
+ *   pedal treadle = cc 11 calibMin 40 calibMax 270 switch 9 son 5 soff 3
+ *   pedal exp1    = off
+ */
+int rk3_midi_load_config(struct rk3_midi *m, const char *path);
+
+/*
+ * Fire HOLD/TAP long-press actions once a held button passes its threshold.
+ * The device only reports on change, so a held button produces no packets to
+ * drive the timer — the caller MUST invoke this regularly (e.g. every ~15ms,
+ * on each idle wakeup of its receive loop). Cheap no-op when nothing is held.
+ */
+void rk3_midi_tick(struct rk3_midi *m, int verbose);
+
+/*
+ * Live pedal calibration. begin() starts capturing the raw ADC min/max for an
+ * axis (0=exp1, 1=exp2, 2=treadle) as reports arrive; finish() stops, applies
+ * the captured range to the in-memory mapping AND persists it to the config
+ * file (rewriting just that pedal's line). Between the two, keep dispatching
+ * reports while the user sweeps the pedal. finish() returns 0 on success (and
+ * fills lo/hi if non-NULL) or -1 if the pedal wasn't moved enough.
+ */
+void rk3_midi_calib_begin(struct rk3_midi *m, int axis);
+int  rk3_midi_calib_finish(struct rk3_midi *m, int axis, int *out_lo, int *out_hi);
 
 /*
  * Also publish a virtual *destination* named `dest_name` that the DAW can send
