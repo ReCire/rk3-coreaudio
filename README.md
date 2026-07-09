@@ -3,6 +3,9 @@
 A userspace **macOS audio + MIDI driver for the Native Instruments RigKontrol 3**
 (USB VID `0x17cc` / PID `0x1940`), built for Apple Silicon.
 
+<img width="900" height="687" alt="image" src="https://github.com/user-attachments/assets/88b9b720-f3f7-4763-ba35-023e423bfd19" />
+
+
 NI never shipped an Apple-Silicon driver for the RigKontrol 3 — the official
 package is a 32-bit-era kext that no longer loads on modern macOS. This project
 reimplements the device protocol (originally from the Linux `snd-usb-caiaq`
