@@ -25,7 +25,7 @@ ENGINE_SRC := usb_iokit.c caiaq_protocol.c codec_mode2.c rk3_engine.c
         sandboxprobe install-probe uninstall-probe probe-log \
         midiprobe install-midi-probe uninstall-midi-probe midi-probe-log \
         driver install-driver uninstall-driver driver-log rk3midi rk3led \
-        rk3monitor install uninstall \
+        rk3monitor install uninstall enginetest enginetest-ll \
         midihelper install-midihelper uninstall-midihelper midihelper-log
 
 all: usbprobe handshake codectest stream epdump
@@ -131,6 +131,21 @@ midihelper-log:
 # Config-descriptor / isoc endpoint sync-type dump (no audio).
 $(BUILD)/epdump: tools/epdump.c usb_iokit.c usb_iokit.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/epdump.c usb_iokit.c $(FRAMEWORKS) -o $@
+
+# Runs the real engine in an ordinary process (device must be free: uninstall the
+# driver first). Proves a transport geometry outside coreaudiod; see the file header.
+enginetest: $(BUILD)/enginetest
+$(BUILD)/enginetest: tools/enginetest.c $(ENGINE_SRC) rk3_engine.h usb_iokit.h \
+		caiaq_protocol.h codec_mode2.h | $(BUILD)
+	$(CC) $(CFLAGS) -DRK3_TEST_HOOKS tools/enginetest.c $(ENGINE_SRC) \
+		$(FRAMEWORKS) -o $@
+
+# Same harness on the LowLatency isoch API (kernel-shared, pre-wired buffers).
+enginetest-ll: $(BUILD)/enginetest-ll
+$(BUILD)/enginetest-ll: tools/enginetest.c $(ENGINE_SRC) rk3_engine.h usb_iokit.h \
+		caiaq_protocol.h codec_mode2.h | $(BUILD)
+	$(CC) $(CFLAGS) -DRK3_TEST_HOOKS -DRK3_USE_LOWLAT=1 tools/enginetest.c \
+		$(ENGINE_SRC) $(FRAMEWORKS) -o $@
 
 # Exercises the installed RigKontrol3.driver (AUHAL bound to our device by UID).
 iotest: $(BUILD)/iotest

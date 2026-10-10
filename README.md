@@ -17,8 +17,8 @@ What you get:
 - **2-in / 2-out USB audio** at 44.1 / 48 / 96 / 192 kHz, switchable live in
   Audio MIDI Setup. Appears as a standard CoreAudio device usable by Reaper,
   the system, or any audio app.
-- **Round-trip latency** — ~12–15 ms loopback at 48 kHz / 64-frame buffer. This
-  is **not yet low and needs improvement** (see `docs/HANDOFF_LATENCY2.md`).
+- **Round-trip latency** — ~8.6–9.1 ms analog loopback at 48 kHz / 64-frame
+  buffer (was ~12–13 ms), using 1 ms USB transfers. See *Latency tuning* below.
 - **MIDI foot controls** — the 9 foot buttons and the pedals are published as a
   CoreMIDI source named **"RigKontrol 3"** (buttons → CC20–28; built-in treadle →
   CC11; the two rear expression-pedal jacks → CC12 / CC13). Always on; works with
@@ -131,6 +131,38 @@ live. See `docs/midi.conf.example` for the full annotated syntax.
 
 (`rk3-reload-config` and `rk3-calibrate` are installed to `/usr/local/bin` by
 `make install-midihelper`.)
+
+## Latency tuning
+
+The driver ships with 1 ms isochronous transfers in both directions (2000 USB
+completions per second). Measured with `./build/iotest 22 --latency` (cable from
+an RK3 output to an RK3 input) on macOS 26 / Apple Silicon at 48 kHz:
+
+| Host buffer | Loopback round trip |
+| --- | --- |
+| 64 frames | ~8.6–9.1 ms |
+| 128 frames | ~10.4 ms |
+| 256 frames | ~12.8 ms |
+
+The small transfers cost CPU in the driver's own process (roughly 20–40 % of one
+core while streaming, versus ~14 % with the previous 4 ms / 2 ms transfers).
+`tools/rk3-tune` changes the geometry and the ring margins on the running driver
+— it takes effect the next time an app starts audio, and is not persistent:
+
+```sh
+tools/rk3-tune 16 8 3        # 2 ms in / 1 ms out: ~1 ms more latency, less CPU
+tools/rk3-tune 32 16 2       # the previous geometry
+tools/rk3-tune 8 8 3 48 48   # tighter ring margins (may click under load)
+```
+
+Arguments are `<in_fpx> <out_fpx> <n_out> [out-ring trough] [capture margin]`
+(microframes per transfer, transfers in flight, frames at 48 kHz). `make
+driver-log` shows a `clk:` line per second with the ring troughs, underrun
+counts and USB error counters; a `BREAKER TRIPPED` line means the engine stopped
+a runaway completion loop and will restart the stream by itself.
+
+To try a geometry outside `coreaudiod` first, uninstall the driver and run
+`make enginetest && ./build/enginetest 20 --in-fpx 8 --out-fpx 8 --n-out 3`.
 
 ### Why the in-place re-sign matters
 
