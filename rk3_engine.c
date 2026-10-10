@@ -1280,6 +1280,15 @@ int rk3_engine_set_rate(struct rk3_engine *e, int rate)
 		ELOG("set_rate: refused while audio running");
 		return -1;
 	}
+	/* The learned extras are frame counts at the old rate; carry them over as
+	 * the same amount of TIME (unscaled, 15 ms learned at 192 kHz became 60 ms
+	 * at 48 kHz). */
+	if (e->rate > 0 && rate != e->rate) {
+		atomic_store(&e->out_extra, (int)((long long)atomic_load(&e->out_extra)
+						  * rate / e->rate));
+		atomic_store(&e->cap_extra, (int)((long long)atomic_load(&e->cap_extra)
+						  * rate / e->rate));
+	}
 	e->rate = rate;
 	e->bpp = caiaq_compute_bpp(rate, e->data_alignment, e->n_streams);
 	engine_apply_rate_scale(e);
@@ -1301,9 +1310,17 @@ static bool adapt_warm(struct rk3_engine *e, UInt64 now)
 	return ticks_to_ms(now - e->audio_t0) >= RK3_ADAPT_WARMUP_S * 1000.0;
 }
 
-/* Widen a ring margin after a miss of `shortfall` frames. */
+/*
+ * Widen a ring margin after a miss of `shortfall` frames. A miss longer than
+ * the largest margin we would ever hold is not jitter but a stall — the host
+ * stopping, reconfiguring or hanging (a DAW changing its sample rate starved
+ * the ring for 230 ms just before StopIO and taught the driver the maximum
+ * margin for nothing). No margin covers those, so they are not learned from.
+ */
 static void adapt_bump(struct rk3_engine *e, atomic_int *extra, int shortfall)
 {
+	if (shortfall > e->rate * RK3_ADAPT_MAX_MS / 1000)
+		return;
 	int cap = e->rate * RK3_ADAPT_BUMP_MAX_MS / 1000;
 	if (shortfall > cap) shortfall = cap;
 	int v = atomic_load_explicit(extra, memory_order_relaxed) + shortfall +

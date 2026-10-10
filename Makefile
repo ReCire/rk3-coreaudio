@@ -24,7 +24,7 @@ ENGINE_SRC := usb_iokit.c caiaq_protocol.c codec_mode2.c rk3_engine.c
 .PHONY: all usbprobe handshake codectest stream epdump test clean \
         sandboxprobe install-probe uninstall-probe probe-log \
         midiprobe install-midi-probe uninstall-midi-probe midi-probe-log \
-        driver install-driver uninstall-driver driver-log rk3midi rk3led \
+        driver install-driver reload-driver uninstall-driver driver-log rk3midi rk3led \
         rk3monitor install uninstall enginetest enginetest-ll \
         midihelper install-midihelper uninstall-midihelper midihelper-log
 
@@ -247,6 +247,21 @@ install-driver: $(DRIVER_BUNDLE)
 	@echo "Installed to $(HAL_DIR). Restarting coreaudiod..."
 	sudo killall coreaudiod || true
 	@echo "Wait ~3s, then check Audio MIDI Setup / 'make driver-log'."
+
+# Replace the installed driver WITHOUT restarting coreaudiod: on macOS versions
+# that host each HAL plugin in its own "Core Audio Driver (<name>.driver)" process,
+# killing just that process makes coreaudiod relaunch it from the new bundle. Use
+# this when a full coreaudiod restart is disruptive (every audio client on the
+# machine re-enumerates). If the device does not come back within ~10 s, fall
+# back to `sudo killall coreaudiod`.
+reload-driver: $(DRIVER_BUNDLE)
+	sudo rm -rf $(HAL_DIR)/RigKontrol3.driver
+	sudo cp -R $(DRIVER_BUNDLE) $(HAL_DIR)/
+	sudo codesign --force --sign - $(HAL_DIR)/RigKontrol3.driver
+	# SIGKILL: the driver host ignores a plain SIGTERM (it kept running the old
+	# code after the bundle was replaced underneath it).
+	sudo pkill -9 -f 'Core Audio Driver \(RigKontrol3' || true
+	@echo "Driver process restarted; coreaudiod left running."
 
 uninstall-driver:
 	sudo rm -rf $(HAL_DIR)/RigKontrol3.driver
