@@ -496,7 +496,7 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 		e->out_shrink = 0;
 		if (adapt_warm(e, now) && e->n_out < RK3_MAX_OUT_XFERS &&
 		    e->n_out < e->n_out_base + RK3_ADAPT_MAX_GROW &&
-		    ticks_to_ms(now - e->out_grow_time) >= RK3_ADAPT_GROW_HOLD_S * 1000.0) {
+		    ticks_to_ms(now - e->out_grow_time) >= RK3_ADAPT_HOLD_S * 1000.0) {
 			struct rk3_iso_xfer *y = &e->out[e->n_out];
 			y->e = e;
 			y->index = e->n_out;
@@ -1208,8 +1208,8 @@ static void reset_audio_state(struct rk3_engine *e)
 	e->in_resyncs = e->out_resyncs = 0;
 	e->out_errs_seen = 0;
 	e->out_shrink = 0;
-	e->audio_t0 = e->out_decay_t = e->out_err_time = e->out_grow_time =
-		mach_absolute_time();
+	e->audio_t0 = e->out_decay_t = e->out_err_time = mach_absolute_time();
+	e->out_grow_time = e->out_bump_t = 0;   /* no hold-off pending */
 	e->cap_quiet = e->cap_holdoff = 0;
 	e->brk_cb = 0;
 	e->brk_t0 = 0;
@@ -1329,12 +1329,12 @@ static void adapt_bump(struct rk3_engine *e, atomic_int *extra, int shortfall)
 	atomic_store_explicit(extra, v > max ? max : v, memory_order_relaxed);
 }
 
-/* Give 1/32 of a ring's extra margin back (called every RK3_ADAPT_DECAY_S quiet). */
+/* Give 1/16 of a ring's extra margin back (called every RK3_ADAPT_DECAY_S quiet). */
 static void adapt_decay(atomic_int *extra)
 {
 	int v = atomic_load_explicit(extra, memory_order_relaxed);
 	if (v > 0)
-		atomic_store_explicit(extra, v - (v / 32 > 0 ? v / 32 : 1),
+		atomic_store_explicit(extra, v - (v / 16 > 0 ? v / 16 : 1),
 				      memory_order_relaxed);
 }
 
@@ -1744,14 +1744,14 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 	if (avail < (unsigned)need &&
 	    atomic_load_explicit(&e->cap_primed, memory_order_relaxed)) {
 		atomic_fetch_add_explicit(&e->cap_underruns, 1, memory_order_relaxed);
-		/* one bump per second at most: a single late delivery can short
-		 * several consecutive reads */
+		/* one bump per disturbance (RK3_ADAPT_HOLD_S): a single late
+		 * delivery can short many consecutive reads */
 		if (e->cap_holdoff <= 0 && adapt_warm(e, mach_absolute_time())) {
 			adapt_bump(e, &e->cap_extra,
 				   (int)((unsigned)need - avail) / RK3_BYTES_PER_FRAME);
-			e->cap_holdoff = e->rate;
-			e->cap_quiet = 0;
+			e->cap_holdoff = e->rate * RK3_ADAPT_HOLD_S;
 		}
+		e->cap_quiet = 0;
 	} else if (e->cap_quiet >= e->rate * RK3_ADAPT_DECAY_S) {
 		adapt_decay(&e->cap_extra);
 		e->cap_quiet = 0;
@@ -1816,12 +1816,14 @@ bool rk3_engine_out_trough(struct rk3_engine *e, int *trough)
 	e->servo_underruns = u;
 	UInt64 now = mach_absolute_time();
 	if (missed) {
-		if (adapt_warm(e, now)) {
+		if (adapt_warm(e, now) &&
+		    ticks_to_ms(now - e->out_bump_t) >= RK3_ADAPT_HOLD_S * 1000.0) {
 			/* one packet carries bpp/8 frames (6 audio bytes per frame,
 			 * 3 of every 4 packet bytes are audio) */
 			adapt_bump(e, &e->out_extra, (int)missed * e->bpp / 8);
-			e->out_decay_t = now;
+			e->out_bump_t = now;
 		}
+		e->out_decay_t = now;
 		*trough = -e->out_fill_setpoint;
 		return true;
 	}

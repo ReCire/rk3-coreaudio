@@ -180,11 +180,15 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
  *
  *  - OUT ring / capture ring: an underrun adds its own shortfall (capped at
  *    RK3_ADAPT_BUMP_MAX_MS) plus RK3_ADAPT_BUMP_MS to that ring's target, up to
- *    RK3_ADAPT_MAX_MS in total; every RK3_ADAPT_DECAY_S without one takes 1/32
- *    of the extra back (half-life ~11 min).
+ *    RK3_ADAPT_MAX_MS in total; every RK3_ADAPT_DECAY_S without one takes 1/16
+ *    of the extra back (half-life ~5 min).
  *  - OUT pipeline: a rejected submit adds one in-flight transfer (+1 stride of
- *    lead), at most RK3_ADAPT_MAX_GROW over the tuned n_out and at most one per
- *    RK3_ADAPT_GROW_HOLD_S; RK3_ADAPT_SHRINK_S without a rejection removes one.
+ *    lead), at most RK3_ADAPT_MAX_GROW over the tuned n_out;
+ *    RK3_ADAPT_SHRINK_S without a rejection removes one.
+ *  - One step per disturbance: after any of the three widens, it will not
+ *    widen again for RK3_ADAPT_HOLD_S. A single event (a file dragged into the
+ *    DAW held this thread up for ~12 s) used to be answered three times over —
+ *    pipeline +3, capture margin +4.4 ms — and kept for ten minutes.
  *
  * Nothing is learned in the first RK3_ADAPT_WARMUP_S of a stream (the start-up
  * transient is not representative). The learned extras survive StopIO/StartIO
@@ -196,8 +200,8 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
 #define RK3_ADAPT_MAX_MS       15
 #define RK3_ADAPT_DECAY_S      30
 #define RK3_ADAPT_MAX_GROW     3
-#define RK3_ADAPT_GROW_HOLD_S  2
-#define RK3_ADAPT_SHRINK_S     600
+#define RK3_ADAPT_HOLD_S       15
+#define RK3_ADAPT_SHRINK_S     180
 #define RK3_PAT_RING        256
 
 /*
@@ -480,6 +484,7 @@ struct rk3_engine {
 	atomic_int out_extra, cap_extra;
 	UInt64     audio_t0;        /* mach time of the last audio_start */
 	UInt64     out_decay_t;     /* mach time of the last OUT bump or decay */
+	UInt64     out_bump_t;      /* mach time of the last OUT bump (hold-off) */
 	int        cap_quiet;       /* frames read since the last capture bump/decay */
 	int        cap_holdoff;     /* frames until the next capture bump may happen */
 	int        n_out_base;      /* tuned n_out; the live n_out may be above it */
