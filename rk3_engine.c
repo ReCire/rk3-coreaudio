@@ -877,36 +877,94 @@ static void boot_set_rate(struct rk3_engine *e)
 }
 
 /*
- * Power-on display sequence, stepped once per boot_timer tick (~90 ms) on the
- * engine run loop: the sample rate flashes twice, then it settles on "Con" and
- * the timer self-invalidates. Purely cosmetic and best-effort (uses the same
- * drop-if-busy WRITE_IO path), so it never touches the audio path.
+ * Power-on display sequence, stepped once per boot_timer tick (RK3_BOOT_TICK_S)
+ * on the engine run loop:
+ *   1. "rIG Kontrol 3" scrolls right-to-left across the four digits while a
+ *      single LED bounces along the eight round LEDs and the pedal LED blinks;
+ *   2. the round LEDs fill 1..8 while the sample rate (kHz) is shown;
+ *   3. everything flashes twice, then it settles on "Con" with the LEDs off and
+ *      the timer self-invalidates.
+ * Purely cosmetic and best-effort (same drop-if-busy WRITE_IO path as the LED
+ * socket), so it never touches the audio path; audio_start cuts it short
+ * (boot_anim_cancel) because AUDIO_PARAMS needs the command pipe to itself.
+ *
+ * led_wbuf layout after the command byte: [1..4] = digits 1..4 (bit0..6 =
+ * segments a..g, bit7 = decimal point), [5] = round LEDs 1..8, [6] = pedal LED.
  */
+#define RK3_BOOT_TICK_S 0.12
+
+/* 7-segment glyphs: r I G _ K o n t r o L _ 3, padded with four blanks each
+ * side so the text enters from the right edge and leaves by the left. */
+static const uint8_t kBootText[] = {
+	0x00, 0x00, 0x00, 0x00,
+	0x50, 0x06, 0x3D, 0x00,                         /* r I G   */
+	0x75, 0x5C, 0x54, 0x78, 0x50, 0x5C, 0x38, 0x00, /* K o n t r o L */
+	0x4F,                                           /* 3 */
+	0x00, 0x00, 0x00, 0x00,
+};
+#define RK3_BOOT_SCROLL ((int)sizeof(kBootText) - 4 + 1)   /* window positions */
+#define RK3_BOOT_FILL   8                                  /* LEDs filling 1..8 */
+
+static void boot_anim_stop_timer(struct rk3_engine *e)
+{
+	if (e->boot_timer) {
+		CFRunLoopTimerInvalidate(e->boot_timer);
+		CFRelease(e->boot_timer);
+		e->boot_timer = NULL;
+	}
+}
+
 static void boot_anim_tick(CFRunLoopTimerRef t, void *info)
 {
 	(void)t;
 	struct rk3_engine *e = info;
 	int s = e->boot_step++;
 
-	switch (s) {
-	case 0:                                            /* rate on */
-	case 2:
-		boot_set_rate(e);
-		led_write_frame(e);
-		break;
-	case 1:                                            /* blank (blink) */
+	if (s < RK3_BOOT_SCROLL) {                         /* 1. scrolling title */
 		memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+		memcpy(e->led_wbuf + 1, kBootText + s, 4);
+		int pos = s % 14;                          /* 0..7..0 bounce */
+		e->led_wbuf[5] = (uint8_t)(1u << (pos < 8 ? pos : 14 - pos));
+		e->led_wbuf[6] = (uint8_t)(s & 1);
 		led_write_frame(e);
-		break;
-	default:                                           /* settle + stop */
-		midi_show_con(e);
-		if (e->boot_timer) {
-			CFRunLoopTimerInvalidate(e->boot_timer);
-			CFRelease(e->boot_timer);
-			e->boot_timer = NULL;
-		}
-		break;
+		return;
 	}
+	s -= RK3_BOOT_SCROLL;
+	if (s < RK3_BOOT_FILL) {                           /* 2. LEDs fill, rate shown */
+		boot_set_rate(e);
+		e->led_wbuf[5] = (uint8_t)((1u << (s + 1)) - 1);
+		e->led_wbuf[6] = 1;
+		led_write_frame(e);
+		return;
+	}
+	s -= RK3_BOOT_FILL;
+	if (s < 4) {                                       /* 3. two flashes */
+		if (s & 1) {
+			boot_set_rate(e);
+			e->led_wbuf[5] = 0xFF;
+			e->led_wbuf[6] = 1;
+		} else {
+			memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+		}
+		led_write_frame(e);
+		return;
+	}
+	midi_show_con(e);                                  /* settle + stop */
+	boot_anim_stop_timer(e);
+}
+
+/* Cut the animation short (engine thread). Waits briefly for an in-flight
+ * display write to complete so the command pipe is free, then leaves "Con" up. */
+static void boot_anim_cancel(struct rk3_engine *e)
+{
+	if (!e->boot_timer)
+		return;
+	boot_anim_stop_timer(e);
+	for (int i = 0; i < 20 && e->led_busy; i++)
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.005, true);
+	midi_show_con(e);
+	for (int i = 0; i < 20 && e->led_busy; i++)
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.005, true);
 }
 
 static void boot_anim_start(struct rk3_engine *e)
@@ -915,7 +973,7 @@ static void boot_anim_start(struct rk3_engine *e)
 	CFRunLoopTimerContext tctx = { 0, e, NULL, NULL, NULL };
 	e->boot_timer = CFRunLoopTimerCreate(NULL,
 			CFAbsoluteTimeGetCurrent(),   /* first frame immediately */
-			0.09,                          /* ~90 ms per frame */
+			RK3_BOOT_TICK_S,
 			0, 0, boot_anim_tick, &tctx);
 	if (e->boot_timer)
 		CFRunLoopAddTimer(CFRunLoopGetCurrent(), e->boot_timer,
@@ -1144,11 +1202,7 @@ static void *engine_thread(void *arg)
 	/* teardown on the engine thread (audio already stopped by close) */
 	led_listen_stop(e);
 	midi_relay_stop(e);
-	if (e->boot_timer) {              /* boot animation still running at close */
-		CFRunLoopTimerInvalidate(e->boot_timer);
-		CFRelease(e->boot_timer);
-		e->boot_timer = NULL;
-	}
+	boot_anim_stop_timer(e);          /* boot animation still running at close */
 	if (e->wd_timer) {
 		CFRunLoopTimerInvalidate(e->wd_timer);
 		CFRelease(e->wd_timer);
@@ -1506,6 +1560,10 @@ int rk3_engine_audio_start(struct rk3_engine *e)
 		 * We're on the engine thread, so this is strictly sequential; the aborted
 		 * read's stale completion is harmless (its midi_running guard returns it).
 		 */
+		/* The power-on animation writes to the command pipe AUDIO_PARAMS is
+		 * about to use (an overlapping write timed AUDIO_PARAMS out). */
+		boot_anim_cancel(e);
+
 		int relay_was_on = atomic_load_explicit(&e->midi_running, memory_order_acquire);
 		if (relay_was_on) {
 			atomic_store_explicit(&e->midi_running, 0, memory_order_release);

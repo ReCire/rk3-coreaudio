@@ -177,10 +177,6 @@ int main(int argc, char **argv)
 		rk3_engine_close(&g_eng);
 		return 1;
 	}
-	/* Let the engine's power-on display animation finish: it writes to the same
-	 * command pipe AUDIO_PARAMS uses. (The plugin opens the engine at load, long
-	 * before the first StartIO, so it never overlaps there.) */
-	sleep(3);
 	if (rk3_engine_audio_start(&g_eng) != 0) {
 		fprintf(stderr, "audio_start failed\n");
 		rk3_engine_close(&g_eng);
