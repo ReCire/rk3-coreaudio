@@ -167,6 +167,37 @@ _Static_assert(RK3_OUT_FRAMES_PER_XFER <= RK3_FRAMES_PER_XFER,
 #define RK3_BRK_RATIO         4
 #define RK3_BRK_MAX_RESTARTS  5
 #define RK3_BRK_RESULTS       6     /* distinct completion result codes tallied */
+
+/*
+ * Adaptive margins. The ring targets above (RK3_OUT_FILL_SETPOINT,
+ * RK3_CAP_FILL_FLOOR) and the OUT pipeline depth are the TIGHTEST the driver
+ * will run, tuned against an idle test client. A DAW under load misses them: a
+ * 9-minute session at 44.1 kHz / 512 frames logged a dozen playback-underrun
+ * events (host IO cycles arriving later than the 1.5 ms ring margin) and 21
+ * rejected OUT submits (this thread's completion callback arriving later than
+ * the 2 ms pipeline lead). So each margin widens itself when it is actually
+ * missed and gives the extra back slowly once things have been quiet:
+ *
+ *  - OUT ring / capture ring: an underrun adds its own shortfall (capped at
+ *    RK3_ADAPT_BUMP_MAX_MS) plus RK3_ADAPT_BUMP_MS to that ring's target, up to
+ *    RK3_ADAPT_MAX_MS in total; every RK3_ADAPT_DECAY_S without one takes 1/32
+ *    of the extra back (half-life ~11 min).
+ *  - OUT pipeline: a rejected submit adds one in-flight transfer (+1 stride of
+ *    lead), at most RK3_ADAPT_MAX_GROW over the tuned n_out and at most one per
+ *    RK3_ADAPT_GROW_HOLD_S; RK3_ADAPT_SHRINK_S without a rejection removes one.
+ *
+ * Nothing is learned in the first RK3_ADAPT_WARMUP_S of a stream (the start-up
+ * transient is not representative). The learned extras survive StopIO/StartIO
+ * and are cleared by rk3_engine_set_tuning. They show in the clk: log line.
+ */
+#define RK3_ADAPT_WARMUP_S     8
+#define RK3_ADAPT_BUMP_MS      1
+#define RK3_ADAPT_BUMP_MAX_MS  3
+#define RK3_ADAPT_MAX_MS       15
+#define RK3_ADAPT_DECAY_S      30
+#define RK3_ADAPT_MAX_GROW     3
+#define RK3_ADAPT_GROW_HOLD_S  2
+#define RK3_ADAPT_SHRINK_S     600
 #define RK3_PAT_RING        256
 
 /*
@@ -354,8 +385,9 @@ typedef IOUSBIsocFrame           rk3_isoc_frame_t;
  * RK3_CAP_REDRAIN_HYST above the floor, the excess is dropped again (a splice of
  * well under a millisecond on the input; none once the servo has settled).
  */
-#define RK3_CAP_REDRAIN_FRAMES 48000                /* 1 s trough window */
-#define RK3_CAP_REDRAIN_HYST   24                   /* 0.5 ms: don't chase noise */
+#define RK3_CAP_REDRAIN_FRAMES (3 * 48000)          /* 3 s trough window */
+#define RK3_CAP_REDRAIN_HYST   48                   /* 1 ms: don't chase noise (1 s / 0.5 ms
+                                                    * spliced 41 times in 9 min under a DAW) */
 
 /* The constants above are all expressed at the 48 kHz reference rate. They are
  * fixed amounts of time / producer-consumer bite, so they scale linearly with the
@@ -442,6 +474,20 @@ struct rk3_engine {
 	/* Circuit breaker + watchdog (engine thread, except the atomics). */
 	atomic_int audio_wanted;   /* between audio_start and audio_stop */
 	atomic_int fault;          /* 0 ok, 1 tripped, 2 pipes aborted (awaiting re-prime) */
+	/* Adaptive margins (see RK3_ADAPT_*). out_extra/cap_extra are frames at the
+	 * current rate, added to out_fill_setpoint / cap_fill_floor; written on the
+	 * IO thread, read by telemetry. The n_out_* fields are engine-thread only. */
+	atomic_int out_extra, cap_extra;
+	UInt64     audio_t0;        /* mach time of the last audio_start */
+	UInt64     out_decay_t;     /* mach time of the last OUT bump or decay */
+	int        cap_quiet;       /* frames read since the last capture bump/decay */
+	int        cap_holdoff;     /* frames until the next capture bump may happen */
+	int        n_out_base;      /* tuned n_out; the live n_out may be above it */
+	int        out_errs_seen;   /* out_errs already acted on */
+	UInt64     out_err_time;    /* mach time of the last rejected OUT submit */
+	UInt64     out_grow_time;   /* mach time of the last pipeline grow */
+	int        out_shrink;      /* drop the last OUT transfer at its next completion */
+
 	unsigned   brk_cb;         /* completions in the current rate window */
 	UInt64     brk_t0;         /* mach time the window opened */
 	UInt64     fault_time;     /* mach time of the trip */
@@ -605,7 +651,7 @@ void rk3_engine_test_burst(struct rk3_engine *e);
 
 /* Servo steady-state OUT-fill target in frames, rate-scaled (RK3_OUT_FILL_SETPOINT
  * at 48 kHz). Read by the driver's rate servo + latency reporting. */
-int  rk3_engine_out_fill_setpoint(const struct rk3_engine *e);
+int  rk3_engine_out_fill_setpoint(struct rk3_engine *e);
 
 /*
  * 1 if a USB completion reported the device gone (unplugged) since open. The

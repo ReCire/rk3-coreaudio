@@ -144,6 +144,17 @@ an RK3 output to an RK3 input) on macOS 26 / Apple Silicon at 48 kHz:
 | 128 frames | ~10.4 ms |
 | 256 frames | ~12.8 ms |
 
+At 192 kHz the same test gives ~7.5 ms at 64 frames, ~8.4 ms at 256 and ~10.5 ms
+at 512 (the host buffer is a quarter as long in time).
+
+Those are the driver's tightest margins, measured against an idle test client.
+Under a loaded DAW the driver widens them by itself: a playback or capture
+underrun adds about a millisecond (plus the shortfall) to that ring's margin, a
+rejected USB submit adds one transfer to the output pipeline, and the extra is
+given back slowly once the stream has been quiet. Expect the round trip to
+settle a few milliseconds higher in a heavy session; the current extras show as
+`margin=+out/+capture` in the `clk:` log line.
+
 The small transfers cost CPU in the driver's own process (roughly 20–40 % of one
 core while streaming, versus ~14 % with the previous 4 ms / 2 ms transfers).
 `tools/rk3-tune` changes the geometry and the ring margins on the running driver
@@ -179,6 +190,10 @@ that ordering if you script your own install.
   or codesign errors. Unplug/replug the RK3 if the interface got wedged.
 - **`coreaudiod` pegged at 100% CPU:** quit audio apps and reboot; never
   `killall coreaudiod` or replug the device mid-stream while it's wedged.
+- **Capture is silent after switching sample rate (older builds):** fixed — the
+  first packets after a rate change carry bad check bytes and used to mute
+  capture for the whole session. `chk_errs` in the `clk:` log line counts any
+  packet muted for that reason after start-up.
 - **No MIDI:** confirm the helper is running (`make midihelper-log`), and that
   the "RigKontrol 3" source is enabled in your DAW. MIDI works with or without
   an active audio stream.

@@ -35,7 +35,7 @@
 #include <unistd.h>
 
 #define MAX_BUF   1024
-#define IMP_LEN   48
+#define IMP_LEN   (g_rate / 1000)   /* 1 ms at any rate */
 #define IMP_AMP   0.95f
 #define MAX_MEAS  256
 
@@ -207,11 +207,12 @@ int main(int argc, char **argv)
 		faults += fault;
 		printf("%3ds cpu=%4.1f%%  out_fill=%4d "
 		       "pb_under=%u cap_over=%u  errs=%d/%d resync=%u/%u io_late=%d "
-		       "fault=%d restarts=%d", s, cpu,
+		       "fault=%d restarts=%d chk_errs=%u out_panic=%d n_out=%d", s, cpu,
 		       rk3_engine_out_fill_frames(&g_eng),
 		       atomic_load(&g_eng.pb_underruns), atomic_load(&g_eng.cap_overruns),
 		       g_eng.in_errs, g_eng.out_errs, g_eng.in_resyncs, g_eng.out_resyncs,
-		       g_io_overruns, fault, g_eng.restarts);
+		       g_io_overruns, fault, g_eng.restarts, g_eng.codec.input_errs,
+		       g_eng.codec.output_panic, g_eng.n_out);
 		for (; last_n < g_nmeas; last_n++)
 			printf("  lat=%.0f", g_meas[last_n]);
 		printf("\n");

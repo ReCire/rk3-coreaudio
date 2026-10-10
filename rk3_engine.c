@@ -104,6 +104,7 @@ static int  submit_in(struct rk3_iso_xfer *x);
 static int  submit_out(struct rk3_iso_xfer *x);
 static void fill_out(struct rk3_engine *e, struct rk3_iso_xfer *x);
 static void out_done(void *refcon, IOReturn result, void *arg0);
+static bool adapt_warm(struct rk3_engine *e, UInt64 now);
 static void in_done(void *refcon, IOReturn result, void *arg0);
 
 /*
@@ -474,9 +475,43 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 	(void)arg0;
 	if (!brk_completion(e, e->out_res, result))
 		return;
+
+	/* Adaptive pipeline depth (RK3_ADAPT_*): retire the last slot when asked. */
+	if (e->out_shrink && x->index == e->n_out - 1) {
+		e->out_shrink = 0;
+		e->n_out--;
+		return;
+	}
+
 	fill_out(e, x);
 	if (submit_out(x) != 0)
 		return;
+
+	UInt64 now = mach_absolute_time();
+	if (e->out_errs != e->out_errs_seen) {
+		/* A submit was rejected: this callback ran later than the pipeline's
+		 * lead. Add one transfer in flight so the next late one still lands. */
+		e->out_errs_seen = e->out_errs;
+		e->out_err_time = now;
+		e->out_shrink = 0;
+		if (adapt_warm(e, now) && e->n_out < RK3_MAX_OUT_XFERS &&
+		    e->n_out < e->n_out_base + RK3_ADAPT_MAX_GROW &&
+		    ticks_to_ms(now - e->out_grow_time) >= RK3_ADAPT_GROW_HOLD_S * 1000.0) {
+			struct rk3_iso_xfer *y = &e->out[e->n_out];
+			y->e = e;
+			y->index = e->n_out;
+			e->n_out++;
+			e->out_grow_time = now;
+			fill_out(e, y);
+			if (submit_out(y) != 0)
+				return;
+			e->out_errs_seen = e->out_errs;
+		}
+	} else if (e->n_out > e->n_out_base && !e->out_shrink &&
+		   ticks_to_ms(now - e->out_err_time) >= RK3_ADAPT_SHRINK_S * 1000.0) {
+		e->out_shrink = 1;
+		e->out_err_time = now;        /* one step per quiet period */
+	}
 
 	/*
 	 * Drift-vs-jitter probe, about once a second (out_done fires 8000/out_fpx
@@ -510,12 +545,14 @@ static void out_done(void *refcon, IOReturn result, void *arg0)
 		res_format(e->in_res, ires, sizeof(ires));
 		res_format(e->out_res, ores, sizeof(ores));
 		ELOG("clk: out_fill=%u (min %u) cap_fill=%u (margin min %u)  dev_rate=%.2f Hz (nominal %d)  underruns=%u cap_under=%u"
-		     "  xfer=%d/%dx%d errs=%d/%d resync=%u/%u drains=%u res in[%{public}s] out[%{public}s]",
+		     "  xfer=%d/%dx%d errs=%d/%d resync=%u/%u drains=%u margin=+%d/+%d chk_errs=%u out_panic=%d res in[%{public}s] out[%{public}s]",
 		     fill, ofmin == ~0u ? 0 : ofmin, capfill, cfmin == ~0u ? 0 : cfmin,
 		     rate, e->rate, atomic_load(&e->pb_underruns),
 		     atomic_load(&e->cap_underruns),
 		     e->in_fpx, e->out_fpx, e->n_out, e->in_errs, e->out_errs,
-		     e->in_resyncs, e->out_resyncs, e->cap_drains, ires, ores);
+		     e->in_resyncs, e->out_resyncs, e->cap_drains,
+		     atomic_load(&e->out_extra), atomic_load(&e->cap_extra),
+		     e->codec.input_errs, e->codec.output_panic, ires, ores);
 	}
 }
 
@@ -1169,6 +1206,11 @@ static void reset_audio_state(struct rk3_engine *e)
 	e->pat_stage_off = e->in_fpx;             /* force a pop on first OUT fill */
 	e->in_errs = e->out_errs = e->out_drops = 0;
 	e->in_resyncs = e->out_resyncs = 0;
+	e->out_errs_seen = 0;
+	e->out_shrink = 0;
+	e->audio_t0 = e->out_decay_t = e->out_err_time = e->out_grow_time =
+		mach_absolute_time();
+	e->cap_quiet = e->cap_holdoff = 0;
 	e->brk_cb = 0;
 	e->brk_t0 = 0;
 	memset(e->in_res, 0, sizeof(e->in_res));
@@ -1245,9 +1287,38 @@ int rk3_engine_set_rate(struct rk3_engine *e, int rate)
 	return 0;
 }
 
-int rk3_engine_out_fill_setpoint(const struct rk3_engine *e)
+int rk3_engine_out_fill_setpoint(struct rk3_engine *e)
 {
-	return e->out_fill_setpoint;
+	/* tuned trough target + whatever the stream has had to add (RK3_ADAPT_*) */
+	return e->out_fill_setpoint +
+	       atomic_load_explicit(&e->out_extra, memory_order_relaxed);
+}
+
+/* True once the stream is past its start-up transient (adaptive margins only
+ * learn from steady-state misses). */
+static bool adapt_warm(struct rk3_engine *e, UInt64 now)
+{
+	return ticks_to_ms(now - e->audio_t0) >= RK3_ADAPT_WARMUP_S * 1000.0;
+}
+
+/* Widen a ring margin after a miss of `shortfall` frames. */
+static void adapt_bump(struct rk3_engine *e, atomic_int *extra, int shortfall)
+{
+	int cap = e->rate * RK3_ADAPT_BUMP_MAX_MS / 1000;
+	if (shortfall > cap) shortfall = cap;
+	int v = atomic_load_explicit(extra, memory_order_relaxed) + shortfall +
+		e->rate * RK3_ADAPT_BUMP_MS / 1000;
+	int max = e->rate * RK3_ADAPT_MAX_MS / 1000;
+	atomic_store_explicit(extra, v > max ? max : v, memory_order_relaxed);
+}
+
+/* Give 1/32 of a ring's extra margin back (called every RK3_ADAPT_DECAY_S quiet). */
+static void adapt_decay(atomic_int *extra)
+{
+	int v = atomic_load_explicit(extra, memory_order_relaxed);
+	if (v > 0)
+		atomic_store_explicit(extra, v - (v / 32 > 0 ? v / 32 : 1),
+				      memory_order_relaxed);
 }
 
 static int fpx_ok(int fpx)
@@ -1278,6 +1349,8 @@ int rk3_engine_set_tuning(struct rk3_engine *e, int in_fpx, int out_fpx,
 	atomic_store(&e->tune_n_out, n_out);
 	atomic_store(&e->tune_out_setpoint, out_setpoint48);
 	atomic_store(&e->tune_cap_floor, cap_floor48);
+	atomic_store(&e->out_extra, 0);       /* a new tuning starts from scratch */
+	atomic_store(&e->cap_extra, 0);
 	ELOG("set_tuning: in_fpx=%d out_fpx=%d n_out=%d setpoint=%d floor=%d "
 	     "(takes effect at next audio_start)",
 	     in_fpx, out_fpx, n_out, out_setpoint48, cap_floor48);
@@ -1303,6 +1376,7 @@ static void tuning_latch(struct rk3_engine *e)
 	e->in_fpx  = atomic_load(&e->tune_in_fpx);
 	e->out_fpx = atomic_load(&e->tune_out_fpx);
 	e->n_out   = atomic_load(&e->tune_n_out);
+	e->n_out_base = e->n_out;
 	engine_apply_rate_scale(e);
 }
 
@@ -1590,6 +1664,9 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 	int need = nframes * RK3_BYTES_PER_FRAME;
 	unsigned r = atomic_load_explicit(&e->cap_r, memory_order_relaxed);
 	unsigned w = atomic_load_explicit(&e->cap_w, memory_order_acquire);
+	/* tuned margin + what this stream has had to add (RK3_ADAPT_*) */
+	const int cap_floor = e->cap_fill_floor +
+		atomic_load_explicit(&e->cap_extra, memory_order_relaxed);
 
 	/*
 	 * One-time startup capture drain. The capture standing fill is an uncontrolled
@@ -1610,8 +1687,8 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 			e->cap_measure_left -= nframes;
 		} else {
 			if (e->cap_meas_min != ~0u &&
-			    e->cap_meas_min > (unsigned)e->cap_fill_floor) {
-				unsigned drop = (e->cap_meas_min - e->cap_fill_floor)
+			    e->cap_meas_min > (unsigned)cap_floor) {
+				unsigned drop = (e->cap_meas_min - cap_floor)
 						* RK3_BYTES_PER_FRAME;
 				r = (r + drop) % RK3_RING_BYTES;   /* trough -> floor */
 			}
@@ -1628,8 +1705,8 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 		e->cap_measure_left -= nframes;
 		if (e->cap_measure_left <= 0) {
 			if (e->cap_meas_min != ~0u && e->cap_meas_min >
-			    (unsigned)(e->cap_fill_floor + e->cap_redrain_hyst)) {
-				unsigned drop = (e->cap_meas_min - e->cap_fill_floor)
+			    (unsigned)(cap_floor + e->cap_redrain_hyst)) {
+				unsigned drop = (e->cap_meas_min - cap_floor)
 						* RK3_BYTES_PER_FRAME;
 				r = (r + drop) % RK3_RING_BYTES;
 				e->cap_drains++;
@@ -1644,9 +1721,24 @@ void rk3_engine_read_input(struct rk3_engine *e, float *dst, int nframes)
 		unsigned af = cap_margin(w, r, nframes);
 		if (af < e->cap_fill_min) e->cap_fill_min = af;
 	}
+	if (e->cap_holdoff > 0)
+		e->cap_holdoff -= nframes;
+	e->cap_quiet += nframes;
 	if (avail < (unsigned)need &&
-	    atomic_load_explicit(&e->cap_primed, memory_order_relaxed))
+	    atomic_load_explicit(&e->cap_primed, memory_order_relaxed)) {
 		atomic_fetch_add_explicit(&e->cap_underruns, 1, memory_order_relaxed);
+		/* one bump per second at most: a single late delivery can short
+		 * several consecutive reads */
+		if (e->cap_holdoff <= 0 && adapt_warm(e, mach_absolute_time())) {
+			adapt_bump(e, &e->cap_extra,
+				   (int)((unsigned)need - avail) / RK3_BYTES_PER_FRAME);
+			e->cap_holdoff = e->rate;
+			e->cap_quiet = 0;
+		}
+	} else if (e->cap_quiet >= e->rate * RK3_ADAPT_DECAY_S) {
+		adapt_decay(&e->cap_extra);
+		e->cap_quiet = 0;
+	}
 	int got = (avail < (unsigned)need) ? (int)avail : need;
 	got -= got % RK3_BYTES_PER_FRAME;
 
@@ -1689,7 +1781,9 @@ void rk3_engine_write_output(struct rk3_engine *e, const float *src, int nframes
 	 * which reads pb_started with acquire, sees the seeded pb_r.
 	 */
 	if (!atomic_load_explicit(&e->pb_started, memory_order_relaxed) &&
-	    w >= (unsigned)e->out_cushion) {
+	    w >= (unsigned)e->out_cushion &&
+	    w >= (unsigned)(2 * nframes + rk3_engine_out_fill_setpoint(e))
+			* RK3_BYTES_PER_FRAME) {
 		atomic_store_explicit(&e->pb_r, RK3_OUT_PHASE, memory_order_relaxed);
 		atomic_store_explicit(&e->pb_started, 1, memory_order_release);
 	}
@@ -1701,11 +1795,22 @@ bool rk3_engine_out_trough(struct rk3_engine *e, int *trough)
 		return false;
 	unsigned m = atomic_exchange_explicit(&e->out_trough, ~0u, memory_order_relaxed);
 	unsigned u = atomic_load_explicit(&e->pb_underruns, memory_order_relaxed);
-	bool underran = u != e->servo_underruns;
+	unsigned missed = u - e->servo_underruns;   /* OUT packets sent as silence */
 	e->servo_underruns = u;
-	if (underran) {
+	UInt64 now = mach_absolute_time();
+	if (missed) {
+		if (adapt_warm(e, now)) {
+			/* one packet carries bpp/8 frames (6 audio bytes per frame,
+			 * 3 of every 4 packet bytes are audio) */
+			adapt_bump(e, &e->out_extra, (int)missed * e->bpp / 8);
+			e->out_decay_t = now;
+		}
 		*trough = -e->out_fill_setpoint;
 		return true;
+	}
+	if (ticks_to_ms(now - e->out_decay_t) >= RK3_ADAPT_DECAY_S * 1000.0) {
+		adapt_decay(&e->out_extra);
+		e->out_decay_t = now;
 	}
 	if (m == ~0u)
 		return false;

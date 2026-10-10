@@ -192,7 +192,7 @@ static int run_input(AudioDeviceID dev, double seconds)
  * shares one clock domain and the in-minus-out delta is the true round-trip
  * (output presentation + analog loopback + input).
  */
-#define LAT_IMP_LEN     48        /* impulse width in frames (~1ms) */
+#define LAT_IMP_LEN     ((int)(RATE / 1000))  /* impulse width: 1 ms at any rate */
 #define LAT_IMP_AMP     0.95f      /* near full-scale for a strong loopback */
 static float g_lat_thresh = 0.05f; /* input detection threshold (--thresh X) */
 #define LAT_THRESH      g_lat_thresh
