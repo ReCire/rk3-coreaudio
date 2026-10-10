@@ -104,7 +104,7 @@ Useful targets (see the `Makefile` for the full list):
 | `make driver-log`, `midihelper-log` | tail the live os_log / helper log |
 | `make all` | build the hardware probe/diagnostic tools |
 | `make iotest` | build the loopback audio test tool |
-| `make test` | run the codec unit test (no hardware) |
+| `make test` | run the codec and MIDI-scaling unit tests (no hardware) |
 
 ## MIDI mapping config
 
@@ -132,7 +132,10 @@ lines are logged (`make midihelper-log`) and skipped. The file lets you set:
   `calibMin`/`calibMax`, and an optional derived on/off `switch` CC with
   `son`/`soff` hysteresis thresholds. The pedals are read as 10-bit values
   (0–1023; the built-in treadle only swings about 40–270) and sent as ordinary
-  7-bit CCs.
+  7-bit CCs by default. Add `hires` to a pedal line to send 14-bit CC instead
+  (MSB on `cc`, which must be 0–31, LSB on `cc`+32): about 230 steps for the
+  treadle and 1024 for the rear jacks, if the receiving software reads 14-bit
+  CC.
 
 Calibrate a pedal's travel with `rk3-calibrate <1|2|3>` (1 = treadle, 2 = EXP1,
 3 = EXP2): it asks the running helper to capture the raw min/max while you sweep

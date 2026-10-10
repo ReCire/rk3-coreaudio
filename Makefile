@@ -40,9 +40,14 @@ $(BUILD)/stream: tools/stream.c $(STREAM_SRC) usb_iokit.h caiaq_protocol.h codec
 	$(CC) $(CFLAGS) tools/stream.c $(STREAM_SRC) $(FRAMEWORKS) -o $@
 	@echo "Built $@ — run ./build/stream <seconds> [--play] with the RK3 plugged in."
 
-# Codec unit test — no hardware required.
-test: $(BUILD)/codectest
+# Unit tests — no hardware required.
+test: $(BUILD)/codectest $(BUILD)/miditest
 	./$(BUILD)/codectest
+	./$(BUILD)/miditest
+
+$(BUILD)/miditest: tools/miditest.c rk3_midi.c rk3_midi.h caiaq_protocol.h | $(BUILD)
+	$(CC) $(CFLAGS) -Wno-unused-function tools/miditest.c \
+		$(FRAMEWORKS) -framework CoreMIDI -o $@
 
 $(BUILD)/codectest: tools/codectest.c codec_mode2.c codec_mode2.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/codectest.c codec_mode2.c -o $@
