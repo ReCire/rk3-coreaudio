@@ -861,29 +861,25 @@ static void midi_show_con(struct rk3_engine *e)
 	led_write_frame(e);
 }
 
-/* Render the live sample rate in kHz (44/48/96/192) left-justified on the
- * 7-seg display: most-significant digit on the leftmost digit. */
-static void boot_set_rate(struct rk3_engine *e)
+/* Show n (0..999) on digits 2-4 with leading zeros; digit 1 stays dark. */
+static void boot_set_number(struct rk3_engine *e, int n)
 {
 	memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
-	int khz = e->rate / 1000;         /* 44, 48, 96, 192 */
-	if (khz <= 0)
-		khz = 48;
-	uint8_t digs[4];
-	int n = 0;
-	while (khz > 0 && n < 4) { digs[n++] = (uint8_t)(khz % 10); khz /= 10; }
-	for (int i = 0; i < n; i++)        /* digs is LSB-first; reverse onto digits */
-		e->led_wbuf[1 + i] = kSegDigit[digs[n - 1 - i]];
+	e->led_wbuf[2] = kSegDigit[(n / 100) % 10];
+	e->led_wbuf[3] = kSegDigit[(n / 10) % 10];
+	e->led_wbuf[4] = kSegDigit[n % 10];
 }
 
 /*
  * Power-on display sequence, stepped once per boot_timer tick (RK3_BOOT_TICK_S)
  * on the engine run loop:
- *   1. "rIG Kontrol 3" scrolls right-to-left across the four digits while a
+ *   1. "rig kontrol 3" scrolls right-to-left across the four digits while a
  *      single LED bounces along the eight round LEDs and the pedal LED blinks;
- *   2. the round LEDs fill 1..8 while the sample rate (kHz) is shown;
- *   3. everything flashes twice, then it settles on "Con" with the LEDs off and
- *      the timer self-invalidates.
+ *   2. a counter races from 000 to 999, accelerating, with the round LEDs as a
+ *      bar graph of its progress;
+ *   3. "999" flashes with all LEDs, then a segment spinner runs around all four
+ *      digits while the LEDs sparkle;
+ *   4. it settles on "Con" with the LEDs off and the timer self-invalidates.
  * Purely cosmetic and best-effort (same drop-if-busy WRITE_IO path as the LED
  * socket), so it never touches the audio path; audio_start cuts it short
  * (boot_anim_cancel) because AUDIO_PARAMS needs the command pipe to itself.
@@ -891,19 +887,24 @@ static void boot_set_rate(struct rk3_engine *e)
  * led_wbuf layout after the command byte: [1..4] = digits 1..4 (bit0..6 =
  * segments a..g, bit7 = decimal point), [5] = round LEDs 1..8, [6] = pedal LED.
  */
-#define RK3_BOOT_TICK_S 0.12
+#define RK3_BOOT_TICK_S 0.03
 
-/* 7-segment glyphs: r I G _ K o n t r o L _ 3, padded with four blanks each
- * side so the text enters from the right edge and leaves by the left. */
+/* 7-segment glyphs, all lowercase: r i g _ k o n t r o l _ 3, padded with four
+ * blanks each side so the text enters from the right edge and leaves by the
+ * left. (A 7-segment digit has no real capital R — the usual one is identical
+ * to A — so the whole name is set in lowercase for consistency.) */
 static const uint8_t kBootText[] = {
 	0x00, 0x00, 0x00, 0x00,
-	0x50, 0x06, 0x3D, 0x00,                         /* r I G   */
-	0x75, 0x5C, 0x54, 0x78, 0x50, 0x5C, 0x38, 0x00, /* K o n t r o L */
+	0x50, 0x04, 0x6F, 0x00,                         /* r i g   */
+	0x75, 0x5C, 0x54, 0x78, 0x50, 0x5C, 0x30, 0x00, /* k o n t r o l */
 	0x4F,                                           /* 3 */
 	0x00, 0x00, 0x00, 0x00,
 };
+#define RK3_BOOT_SCROLL_DIV 4                              /* ticks per scroll step */
 #define RK3_BOOT_SCROLL ((int)sizeof(kBootText) - 4 + 1)   /* window positions */
-#define RK3_BOOT_FILL   8                                  /* LEDs filling 1..8 */
+#define RK3_BOOT_COUNT  40                                 /* ticks 000 -> 999 */
+#define RK3_BOOT_FLASH  12                                 /* ticks: 999 blinks */
+#define RK3_BOOT_SPIN   24                                 /* ticks: spinner */
 
 static void boot_anim_stop_timer(struct rk3_engine *e)
 {
@@ -920,7 +921,10 @@ static void boot_anim_tick(CFRunLoopTimerRef t, void *info)
 	struct rk3_engine *e = info;
 	int s = e->boot_step++;
 
-	if (s < RK3_BOOT_SCROLL) {                         /* 1. scrolling title */
+	if (s < RK3_BOOT_SCROLL * RK3_BOOT_SCROLL_DIV) {   /* 1. scrolling title */
+		if (s % RK3_BOOT_SCROLL_DIV)
+			return;
+		s /= RK3_BOOT_SCROLL_DIV;
 		memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
 		memcpy(e->led_wbuf + 1, kBootText + s, 4);
 		int pos = s % 14;                          /* 0..7..0 bounce */
@@ -929,27 +933,39 @@ static void boot_anim_tick(CFRunLoopTimerRef t, void *info)
 		led_write_frame(e);
 		return;
 	}
-	s -= RK3_BOOT_SCROLL;
-	if (s < RK3_BOOT_FILL) {                           /* 2. LEDs fill, rate shown */
-		boot_set_rate(e);
-		e->led_wbuf[5] = (uint8_t)((1u << (s + 1)) - 1);
-		e->led_wbuf[6] = 1;
+	s -= RK3_BOOT_SCROLL * RK3_BOOT_SCROLL_DIV;
+	if (s < RK3_BOOT_COUNT) {                          /* 2. 000 -> 999, accelerating */
+		int n = 999 * (s + 1) * (s + 1) / (RK3_BOOT_COUNT * RK3_BOOT_COUNT);
+		boot_set_number(e, n);
+		e->led_wbuf[5] = (uint8_t)((1u << (n * 8 / 999)) - 1);   /* bar graph */
+		e->led_wbuf[6] = (uint8_t)(s & 1);
 		led_write_frame(e);
 		return;
 	}
-	s -= RK3_BOOT_FILL;
-	if (s < 4) {                                       /* 3. two flashes */
-		if (s & 1) {
-			boot_set_rate(e);
+	s -= RK3_BOOT_COUNT;
+	if (s < RK3_BOOT_FLASH) {                          /* 3a. 999 blinks */
+		if ((s / 3) & 1) {
+			memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+		} else {
+			boot_set_number(e, 999);
 			e->led_wbuf[5] = 0xFF;
 			e->led_wbuf[6] = 1;
-		} else {
-			memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
 		}
 		led_write_frame(e);
 		return;
 	}
-	midi_show_con(e);                                  /* settle + stop */
+	s -= RK3_BOOT_FLASH;
+	if (s < RK3_BOOT_SPIN) {                           /* 3b. spinner + sparkle */
+		memset(e->led_wbuf + 1, 0, EP1_BUFSIZE - 1);
+		for (int d = 0; d < 4; d++)                /* segments a..f in a ring,
+		                                            * each digit one step behind */
+			e->led_wbuf[1 + d] = (uint8_t)(1u << ((s + 6 - d) % 6));
+		e->led_wbuf[5] = (uint8_t)((s * 0x9D + 0x35) ^ (s << 3));
+		e->led_wbuf[6] = (uint8_t)((s >> 1) & 1);
+		led_write_frame(e);
+		return;
+	}
+	midi_show_con(e);                                  /* 4. settle + stop */
 	boot_anim_stop_timer(e);
 }
 

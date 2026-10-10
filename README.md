@@ -30,9 +30,9 @@ What you get:
   decimal point blinks on the beat (`Con` → `Con.`), aligned to the transport's
   Start/Continue and cleared on Stop.
 - **LED / 7-segment control** over a loopback socket (see `tools/rk3led`).
-- **Power-on animation** — when the driver claims the device, `rIG Kontrol 3`
-  scrolls across the display with an LED chase, the sample rate flashes, and it
-  settles on `Con`.
+- **Power-on animation** — when the driver claims the device, `rig kontrol 3`
+  scrolls across the display with an LED chase, a counter races from 000 to 999
+  with the LEDs as a bar graph, a segment spinner runs, and it settles on `Con`.
 
 > **Unofficial / unaffiliated.** "RigKontrol" and "Native Instruments" are
 > trademarks of Native Instruments GmbH. This project is an independent,
