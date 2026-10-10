@@ -65,8 +65,10 @@ What you get:
    - strip the `com.apple.quarantine` attribute,
    - copy `RigKontrol3.driver` to `/Library/Audio/Plug-Ins/HAL/`,
    - re-sign it in place (required — see note below),
-   - install the MIDI helper to `/usr/local/bin` + a per-user LaunchAgent,
-   - restart `coreaudiod`.
+   - install the MIDI helper and the `rk3-*` companion scripts to
+     `/usr/local/bin` + a per-user LaunchAgent,
+   - restart `coreaudiod` on a first install, or only the driver's own host
+     process on an upgrade.
 
 3. Plug in the RigKontrol 3. It should appear in **Audio MIDI Setup** as a
    2-in/2-out device, the display should read `CON`, and a **"RigKontrol 3"**
@@ -168,7 +170,7 @@ settle a few milliseconds higher in a heavy session; the current extras show as
 
 The small transfers cost CPU in the driver's own process (roughly 20–40 % of one
 core while streaming, versus ~14 % with the previous 4 ms / 2 ms transfers).
-`tools/rk3-tune` changes the geometry and the ring margins on the running driver
+`rk3-tune` (in `tools/`, installed to `/usr/local/bin`) changes the geometry and the ring margins on the running driver
 — it takes effect the next time an app starts audio, and is not persistent:
 
 ```sh
