@@ -663,6 +663,9 @@ int  rk3_engine_out_fill_setpoint(struct rk3_engine *e);
  * plugin supervisor polls this to close + reopen the engine on the next attach.
  */
 int  rk3_engine_usb_dead(struct rk3_engine *e);
+/* 0 once the device instance the engine opened has been detached (unplug, or a
+ * re-enumeration): the handle is stale and the engine must be closed/reopened. */
+int  rk3_engine_present(const struct rk3_engine *e);
 
 /*
  * Convenience composites (open+audio_start / audio_stop+close) preserving the

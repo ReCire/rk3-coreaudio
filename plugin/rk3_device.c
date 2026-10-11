@@ -258,7 +258,10 @@ static void *engine_supervisor(void *arg)
 		pthread_mutex_lock(&gStateMutex);
 		if (!gEngineOpen) {
 			engine_open_locked();          /* quietly retry if it fails */
-		} else if (gIOCount == 0 && rk3_engine_usb_dead(&gEngine)) {
+		} else if (gIOCount == 0 && (rk3_engine_usb_dead(&gEngine) ||
+					     !rk3_engine_present(&gEngine))) {
+			/* usb_dead needs a completion to report NoDevice; the registry
+			 * check also catches an unplug that only ever reported Aborted. */
 			DLOG("supervisor: device gone — closing engine; reopen on attach");
 			rk3_engine_close(&gEngine);
 			gEngineOpen = 0;

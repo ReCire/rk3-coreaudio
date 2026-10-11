@@ -737,8 +737,22 @@ static void midi_read_done(void *refcon, IOReturn result, void *arg0)
 	struct rk3_engine *e = refcon;
 	if (!atomic_load_explicit(&e->midi_running, memory_order_acquire))
 		return;
-	if (result == kIOReturnAborted)
-		return;                       /* teardown: stop the chain */
+	/*
+	 * kIOReturnAborted with midi_running still set is NOT our teardown (every
+	 * abort of ours clears midi_running first, caught above): the system
+	 * aborted the read — sleep/wake, or the device being unplugged, which
+	 * reports Aborted rather than NoDevice here. Returning now, as this used
+	 * to, left the relay dead and the engine holding a stale handle for good:
+	 * no MIDI after a wake, and a re-plugged RK3 was never claimed again. So
+	 * fall through to the throttled re-arm; if the device is really gone the
+	 * plugin supervisor sees it via rk3_engine_present and recycles the engine.
+	 */
+	if (result == kIOReturnAborted && !rk3_usb_present(&e->usb)) {
+		ELOG("midi relay: read aborted and the device is detached — USB dead");
+		atomic_store_explicit(&e->usb_dead, 1, memory_order_release);
+		atomic_store_explicit(&e->midi_running, 0, memory_order_release);
+		return;
+	}
 
 	/*
 	 * Device-gone detection. When the RK3 is unplugged, the armed read
@@ -1694,6 +1708,11 @@ void rk3_engine_test_burst(struct rk3_engine *e)
 	});
 }
 #endif
+
+int rk3_engine_present(const struct rk3_engine *e)
+{
+	return rk3_usb_present(&e->usb);
+}
 
 int rk3_engine_usb_dead(struct rk3_engine *e)
 {

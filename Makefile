@@ -135,6 +135,12 @@ uninstall-midihelper:
 midihelper-log:
 	@tail -n 50 /tmp/rk3midihelper.log 2>/dev/null || echo "(no log yet)"
 
+# Watch the "RigKontrol 3" MIDI source and summarise a pedal's CC stream
+# (message rate, distinct values, 7-bit vs 14-bit). ./build/midimon [secs] [cc]
+midimon: $(BUILD)/midimon
+$(BUILD)/midimon: tools/midimon.c | $(BUILD)
+	$(CC) $(CFLAGS) tools/midimon.c $(FRAMEWORKS) -framework CoreMIDI -o $@
+
 # Config-descriptor / isoc endpoint sync-type dump (no audio).
 $(BUILD)/epdump: tools/epdump.c usb_iokit.c usb_iokit.h | $(BUILD)
 	$(CC) $(CFLAGS) tools/epdump.c usb_iokit.c $(FRAMEWORKS) -o $@
